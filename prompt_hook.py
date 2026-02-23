@@ -62,11 +62,12 @@ def main():
 
     lines.append(f"[graph] {len(graph_relevant)} synthesized memor{'ies' if len(graph_relevant) != 1 else 'y'}:")
     for r in graph_relevant:
+        node_id = r.get("id", "?")
         ntype = r.get("type", "?")
         sim = r.get("similarity", 0)
         text = r.get("text", "")[:200]
         source_ids = r.get("source_ids", [])
-        lines.append(f"  {sim:.2f} | [{ntype}] {text}")
+        lines.append(f"  {sim:.2f} | {node_id[:12]} | [{ntype}] {text}")
         if source_ids:
             # Show first few source chunk IDs for traceability
             shown = source_ids[:3]

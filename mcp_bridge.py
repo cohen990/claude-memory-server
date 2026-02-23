@@ -244,5 +244,38 @@ async def memory_stats() -> str:
     return "\n".join(lines)
 
 
+LOG_PATH = os.path.expanduser("~/.claude/memory_utility.log")
+
+RATING_VALUES = {
+    "U": ("USED", 2),
+    "I": ("INTERESTING", 1),
+    "N": ("NOISE", 0),
+    "D": ("DISTRACTING", -1),
+    "M": ("MISLEADING", -2),
+}
+
+
+@mcp.tool()
+async def log_memory_utility(entries: str) -> str:
+    """Log memory utility ratings for injected graph memories.
+
+    Call this once per turn when graph memories are injected via the prompt hook.
+    Pass the full log block as a single string.
+
+    Format:
+        --- {ISO timestamp} | session:{session_id} | {N} memories injected ---
+        {similarity} {USED|INTERESTING|NOISE} | {first ~80 chars of memory text}
+
+    Args:
+        entries: The formatted log block to append.
+    """
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(entries.rstrip("\n") + "\n\n")
+        return "Logged."
+    except Exception as e:
+        return f"Error: {e}"
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
