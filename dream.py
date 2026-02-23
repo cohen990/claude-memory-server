@@ -43,6 +43,32 @@ COLLECTION_NAME = "conversations"
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _compute_weight_boost(old_weight: float, count: int,
+                          boost: float = ACTIVATION_WEIGHT_BOOST,
+                          cap: float = 0.95) -> float:
+    """Compute boosted edge weight using log-weighted activation count."""
+    return min(cap, old_weight + boost * (1 + math.log(count)))
+
+
+def _blend_embeddings(node_emb: np.ndarray,
+                      neighbor_embs: list[np.ndarray],
+                      neighbor_weights: list[float]) -> np.ndarray:
+    """Weighted average: node (weight=1) + neighbors (by edge weight)."""
+    total_weight = 1.0 + sum(neighbor_weights)
+    blended = node_emb.copy()
+    for emb, w in zip(neighbor_embs, neighbor_weights):
+        blended += emb * w
+    blended /= total_weight
+    return blended
+
+
+def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine distance between two vectors: 1.0 - cos(a, b)."""
+    a_norm = a / np.linalg.norm(a)
+    b_norm = b / np.linalg.norm(b)
+    return 1.0 - float(np.dot(a_norm, b_norm))
+
+
 def embed_text(text: str) -> np.ndarray:
     """Get embedding from memory server's /embed endpoint."""
     body = json.dumps({"text": text}).encode("utf-8")
@@ -391,8 +417,7 @@ def cmd_reconsolidate(args):
     for edge in activated:
         count = edge["activation_count"]
         old_weight = edge["weight"]
-        boost = ACTIVATION_WEIGHT_BOOST * (1 + math.log(count))
-        new_weight = min(0.95, old_weight + boost)
+        new_weight = _compute_weight_boost(old_weight, count)
         graph.update_edge_weight(edge["source_id"], edge["target_id"], new_weight)
         print(f"  Edge {edge['source_id'][:8]}→{edge['target_id'][:8]}: "
               f"{old_weight:.2f} → {new_weight:.2f} ({count} activations)")
@@ -433,22 +458,13 @@ def cmd_reconsolidate(args):
         if not neighbor_embeddings:
             continue
 
-        # Weighted average: self (weight=1) + neighbors (by edge weight)
-        total_weight = 1.0 + sum(neighbor_weights)
-        blended = node["embedding"].copy()
-        for emb, w in zip(neighbor_embeddings, neighbor_weights):
-            blended += emb * w
-        blended /= total_weight
-
+        blended = _blend_embeddings(node["embedding"], neighbor_embeddings, neighbor_weights)
         graph.update_node_embedding(node_id, blended)
 
         # Check staleness: is the text still a good description of the embedding?
         try:
             text_embedding = embed_text(node["text"])
-            # Cosine distance
-            text_norm = text_embedding / np.linalg.norm(text_embedding)
-            blend_norm = blended / np.linalg.norm(blended)
-            cosine_dist = 1.0 - float(np.dot(text_norm, blend_norm))
+            cosine_dist = _cosine_distance(text_embedding, blended)
 
             if cosine_dist > STALENESS_THRESHOLD:
                 print(f"  Node {node_id[:8]}... stale (dist={cosine_dist:.3f}), re-synthesizing text...")

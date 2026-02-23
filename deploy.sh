@@ -26,6 +26,7 @@ rsync -avz \
   --exclude='*.pyc' \
   --exclude=.venv \
   --exclude=.git \
+  --exclude=.env \
   "$SCRIPT_DIR/" "$REMOTE:$REMOTE_DIR/"
 
 if [[ "${1:-}" == "--restart" ]]; then
