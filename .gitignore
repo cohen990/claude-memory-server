@@ -5,3 +5,9 @@ __pycache__/
 .env
 CLAUDE.md
 .claude/
+.pytest_cache/
+*.db
+chromadb/
+*.log
+incoming/
+failed/

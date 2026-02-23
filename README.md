@@ -4,6 +4,8 @@ Persistent conversation memory for Claude Code. Embeds conversation transcripts 
 
 > **Note**: This project is fully vibe coded. Trust accordingly.
 
+> **Security**: This server has no authentication and is designed to run on a trusted private network (e.g. a direct ethernet link or isolated LAN). Do not expose it to the internet. The memory store contains sensitive personal data — treat it like an unencrypted diary. PRs adding auth are welcome.
+
 ## Architecture
 
 ```mermaid

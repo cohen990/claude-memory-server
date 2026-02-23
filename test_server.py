@@ -41,11 +41,11 @@ def client(tmp_path_factory):
             # Seed test data
             resp = c.post("/ingest", json={"chunks": [
                 {
-                    "text": "User: How does the syneme parser work?\n\nAssistant: The parser uses Python's tokenize module to build a tree of every token.",
-                    "user_text": "How does the syneme parser work?",
+                    "text": "User: How does the acme parser work?\n\nAssistant: The parser uses Python's tokenize module to build a tree of every token.",
+                    "user_text": "How does the acme parser work?",
                     "session_id": "session-aaa",
                     "timestamp": "2025-06-01T10:00:00Z",
-                    "project": "/home/user/syneme",
+                    "project": "/home/user/acme",
                     "turn_number": 0,
                     "branch": "main",
                 },
@@ -54,7 +54,7 @@ def client(tmp_path_factory):
                     "user_text": "What is reference distance?",
                     "session_id": "session-aaa",
                     "timestamp": "2025-06-01T10:05:00Z",
-                    "project": "/home/user/syneme",
+                    "project": "/home/user/acme",
                     "turn_number": 1,
                     "branch": "main",
                 },
@@ -107,7 +107,7 @@ def test_stats_collection_names(client):
 # ---------------------------------------------------------------------------
 
 def test_search_post_returns_results(client):
-    resp = client.post("/search", json={"q": "syneme parser tokenize", "k": 3})
+    resp = client.post("/search", json={"q": "acme parser tokenize", "k": 3})
     results = resp.json()["results"]
     assert len(results) > 0
     assert "text" in results[0]
@@ -190,10 +190,10 @@ def test_search_user_inputs_project_filter(client):
     resp = client.post("/search_user_inputs", json={
         "q": "parser",
         "k": 10,
-        "project": "/home/user/syneme",
+        "project": "/home/user/acme",
     })
     results = resp.json()["results"]
-    assert all(r["project"] == "/home/user/syneme" for r in results)
+    assert all(r["project"] == "/home/user/acme" for r in results)
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +202,10 @@ def test_search_user_inputs_project_filter(client):
 
 def test_ingest_summary(client):
     resp = client.post("/ingest_summary", json={
-        "text": "This session discussed syneme parser internals and reference distance.",
+        "text": "This session discussed acme parser internals and reference distance.",
         "session_id": "session-aaa",
         "timestamp": "2025-06-01T11:00:00Z",
-        "project": "/home/user/syneme",
+        "project": "/home/user/acme",
     })
     assert resp.status_code == 201
     assert resp.json()["queued"] == 1
@@ -245,11 +245,11 @@ def test_duplicate_ingest_does_not_create_duplicates(client):
     # Re-ingest the same chunk from seed data
     resp = client.post("/ingest", json={"chunks": [
         {
-            "text": "User: How does the syneme parser work?\n\nAssistant: The parser uses Python's tokenize module to build a tree of every token.",
-            "user_text": "How does the syneme parser work?",
+            "text": "User: How does the acme parser work?\n\nAssistant: The parser uses Python's tokenize module to build a tree of every token.",
+            "user_text": "How does the acme parser work?",
             "session_id": "session-aaa",
             "timestamp": "2025-06-01T10:00:00Z",
-            "project": "/home/user/syneme",
+            "project": "/home/user/acme",
             "turn_number": 0,
             "branch": "main",
         },
