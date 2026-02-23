@@ -75,6 +75,22 @@ graph TD
 
 All search endpoints apply MMR (Maximal Marginal Relevance, lambda=0.7) for diverse results. Graph search walks the neighborhood and strengthens traversed edges — retrieval itself reinforces associations for the next dream cycle.
 
+## Hardware Requirements
+
+The server runs an embedding model ([nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5)) locally. It can run on modest hardware — an old desktop or a Raspberry Pi 5 will work.
+
+| Component | Minimum | Recommended |
+|---|---|---|
+| RAM | 4 GB | 8+ GB |
+| CPU | Any x86_64 / ARM64 | 4+ cores |
+| GPU | None (CPU works) | Any CUDA GPU with compute capability 7.0+ |
+| Disk | 2 GB | 10+ GB (scales with conversation history) |
+| Python | 3.10 | 3.12 or 3.13 |
+
+**GPU notes**: A CUDA-capable GPU (RTX 20-series or newer) speeds up embedding ~5-10x but is not required. Older GPUs (GTX 900/1000 series) won't work with current PyTorch — use `EMBED_DEVICE=cpu` instead. The graph layer and ChromaDB are CPU-only regardless.
+
+**Separate machine**: The server is designed to run on a dedicated machine (even an old one gathering dust) so embedding doesn't compete with your dev workload. A direct ethernet cable or LAN connection to your dev machine is all you need. It also works fine on the same machine if you prefer.
+
 ## Setup — Server Machine
 
 ### 1. Install dependencies
