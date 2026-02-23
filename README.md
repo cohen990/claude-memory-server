@@ -77,7 +77,7 @@ graph TD
     DREAM --> D
 ```
 
-All search endpoints apply MMR (Maximal Marginal Relevance, lambda=0.7) for diverse results. Graph search walks the neighborhood and strengthens traversed edges — retrieval itself reinforces associations for the next dream cycle.
+All search endpoints apply MMR (Maximal Marginal Relevance, lambda=0.7) for diverse results. Graph search walks the neighborhood; edge weights are adjusted during the dream cycle based on agent ratings of recalled memories.
 
 ## Hardware Requirements
 
@@ -206,7 +206,45 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-### 4. Backfill historical conversations
+### 4. Agent instructions and permissions
+
+The prompt hook injects graph memories with a recall ID. For the feedback loop to work, the agent needs instructions to rate them and permission to do so without prompting.
+
+Add to your global `~/.claude/CLAUDE.md`:
+
+```markdown
+## Memory Ratings
+
+When graph memories are injected via the prompt hook, rate them using the
+`rate_memories` MCP tool. Do this once per turn, after reading the memories
+but before responding to the user.
+
+The prompt hook output includes a recall ID. Pass it back with one rating
+code per memory, in order:
+
+    recall_id:U,I,N,N,M
+
+Codes:
+- U (USED) — directly informed your response
+- I (INTERESTING) — didn't use it, but it added context or shaped your understanding
+- N (NOISE) — irrelevant to what's happening
+- D (DISTRACTING) — irrelevant and got in the way
+- M (MISLEADING) — wrong or outdated, actively harmful to have seen
+```
+
+Auto-allow the rating tool in `~/.claude/settings.json` so the agent doesn't prompt on every turn:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__memory__rate_memories"
+    ]
+  }
+}
+```
+
+### 5. Backfill historical conversations
 
 ```bash
 MEMORY_SERVER_URL=http://your-server:8420 python batch_import.py
@@ -262,7 +300,7 @@ python dream.py consolidate
 # Limit to last 7 days only
 python dream.py consolidate --days 7
 
-# Process activated edges (boost weights, reconsolidate embeddings)
+# Process rated recalls (adjust edge weights, reconsolidate embeddings)
 python dream.py reconsolidate
 
 # Full cycle: consolidate + reconsolidate
@@ -342,6 +380,7 @@ curl -X POST http://your-server:8420/search_graph \
 | `MEMORY_MAX_RESULTS` | `5` | prompt_hook.py |
 | `DREAM_MODEL` | `sonnet` | dream.py |
 | `SIMILARITY_THRESHOLD` | `0.85` | dream.py |
+| `RATING_SCALE` | `0.02` | dream.py — multiplier for rating-driven edge weight changes |
 
 ## How It Works
 
@@ -349,6 +388,8 @@ curl -X POST http://your-server:8420/search_graph \
 
 **Search**: The MCP bridge exposes `search_memory` (coarse, full turn pairs), `search_memory_detail` (fine, ~500-char subchunks), and `search_memory_graph` (synthesized long-term memories). All vector search uses MMR re-ranking for diversity.
 
-**Prompt hook**: Fires on UserPromptSubmit. Searches user_inputs and graph memory, injects compact hints so Claude knows what's relevant without fetching full context. These hints are private to the agent — the user doesn't see them.
+**Prompt hook**: Fires on UserPromptSubmit. Searches user_inputs and graph memory, injects compact hints so Claude knows what's relevant without fetching full context. Each graph search creates a recall with a unique ID. These hints are private to the agent — the user doesn't see them.
 
-**Dream pipeline**: Nightly consolidation reads recent conversations, synthesizes them into graph nodes (vibes and details) via Claude CLI, and connects them with weighted edges. Reconsolidation boosts frequently-traversed edges, blends node embeddings with their neighbors, and re-synthesizes stale text descriptions.
+**Ratings**: The agent rates each recalled memory (U/I/N/D/M) using the `rate_memories` MCP tool. Ratings are stored on the recall and drive edge weight adjustments during the next dream cycle. Unrated recalls have no effect — only explicit ratings change the graph.
+
+**Dream pipeline**: Nightly consolidation reads recent conversations, synthesizes them into graph nodes (vibes and details) via Claude CLI, and connects them with weighted edges. Reconsolidation processes rated recalls — adjusting edge weights by `rating_value * cosine_similarity * RATING_SCALE` — then blends node embeddings with their neighbors and re-synthesizes stale text descriptions.

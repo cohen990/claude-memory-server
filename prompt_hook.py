@@ -17,8 +17,11 @@ import urllib.error
 SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
 
 
-def search_graph(query: str, k: int = 5) -> list[dict]:
-    """Search the graph memory layer for synthesized long-term memories."""
+def search_graph(query: str, k: int = 5) -> dict:
+    """Search the graph memory layer for synthesized long-term memories.
+
+    Returns {"results": [...], "recall_id": str|None}.
+    """
     body = {"q": query, "k": k, "expand_neighbors": True}
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -29,9 +32,9 @@ def search_graph(query: str, k: int = 5) -> list[dict]:
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read()).get("results", [])
+            return json.loads(resp.read())
     except Exception:
-        return []
+        return {"results": [], "recall_id": None}
 
 
 def main():
@@ -41,7 +44,7 @@ def main():
         return
 
     prompt = hook_input.get("prompt", "")
-    if not prompt or len(prompt) < 10:
+    if not prompt:
         return
 
     # Skip slash commands
@@ -51,7 +54,9 @@ def main():
     current_session = hook_input.get("session_id", "")
 
     # Graph memory search
-    graph_results = search_graph(prompt, k=5)
+    graph_data = search_graph(prompt, k=5)
+    graph_results = graph_data.get("results", [])
+    recall_id = graph_data.get("recall_id")
     graph_relevant = [r for r in graph_results if r.get("similarity", 0) > 0.5]
     if not graph_relevant:
         return
@@ -60,7 +65,8 @@ def main():
     if current_session:
         lines.append(f"(current session: {current_session} — pass as exclude_session_id to avoid self-references)")
 
-    lines.append(f"[graph] {len(graph_relevant)} synthesized memor{'ies' if len(graph_relevant) != 1 else 'y'}:")
+    recall_tag = f" recall:{recall_id}" if recall_id else ""
+    lines.append(f"[graph]{recall_tag} | {len(graph_relevant)} synthesized memor{'ies' if len(graph_relevant) != 1 else 'y'}:")
     for r in graph_relevant:
         node_id = r.get("id", "?")
         ntype = r.get("type", "?")
@@ -77,6 +83,8 @@ def main():
     lines.append("These are your private memories from past sessions. The user cannot see this section.")
     lines.append("Detail memories are associative recall, not authoritative records — validate specifics against source conversations before relying on them.")
     lines.append("Use search_memory or search_memory_detail tools with session_id to retrieve full source conversations.")
+    if recall_id:
+        lines.append(f"Rate these memories using rate_memories tool: {recall_id}:U,I,N,N,M (one code per memory above, in order)")
     lines.append("--- END AGENT MEMORY ---")
     print("\n".join(lines))
 

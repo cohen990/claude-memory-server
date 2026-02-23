@@ -3,8 +3,8 @@
 Standalone module, no FastAPI dependency. Owns the sqlite DB and all
 graph operations. Nodes hold synthesized memories (vibes/details) with
 embeddings; edges encode weighted associations between them. Search
-walks the graph neighborhood, and retrieval strengthens edges for
-reconsolidation during the next dream cycle.
+walks the graph neighborhood; recalls and agent ratings drive edge
+weight changes during dream reconsolidation.
 """
 
 import json
@@ -72,6 +72,25 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
+
+            CREATE TABLE IF NOT EXISTS recalls (
+                id TEXT PRIMARY KEY,
+                query_embedding BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS recall_results (
+                recall_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                node_id TEXT NOT NULL,
+                similarity REAL NOT NULL,
+                source TEXT NOT NULL,
+                connected_via TEXT,
+                rating TEXT,
+                PRIMARY KEY (recall_id, position),
+                FOREIGN KEY (recall_id) REFERENCES recalls(id),
+                FOREIGN KEY (node_id) REFERENCES nodes(id)
+            );
         """)
         # Partial index for activated edges — sqlite requires separate statement
         try:
@@ -347,11 +366,13 @@ class GraphStore:
                expand_neighbors: bool = True) -> list[dict]:
         """Search the graph by vector similarity with optional neighbor expansion.
 
+        Pure read — no side effects. Recalls and ratings drive edge weight
+        changes during dream reconsolidation.
+
         1. Brute-force cosine across all nodes
         2. Take top k*2 seeds
         3. For top k seeds, expand neighbors scored by edge_weight*0.3 + similarity*0.7
         4. Merge, deduplicate, return top k
-        5. Batch-activate all traversed edges
         """
         if self._embeddings.shape[0] == 0:
             return []
@@ -378,7 +399,6 @@ class GraphStore:
             }
 
         # Expand neighbors for top k seeds
-        activated_edges: list[tuple[str, str]] = []
         if expand_neighbors:
             seed_ids = [self._node_ids[int(i)] for i in top_indices[:k]]
             for seed_id in seed_ids:
@@ -388,8 +408,6 @@ class GraphStore:
                         edge["target_id"] if edge["source_id"] == seed_id
                         else edge["source_id"]
                     )
-                    # Track edge for activation (always use canonical order)
-                    activated_edges.append((edge["source_id"], edge["target_id"]))
 
                     if neighbor_id in results:
                         continue  # already a seed or neighbor
@@ -410,16 +428,6 @@ class GraphStore:
                         "connected_via": seed_id,
                     }
 
-        # Batch activate traversed edges
-        if activated_edges:
-            now = datetime.now(timezone.utc).isoformat()
-            self.conn.executemany(
-                "UPDATE edges SET activation_count = activation_count + 1, "
-                "last_activated = ? WHERE source_id = ? AND target_id = ?",
-                [(now, src, tgt) for src, tgt in activated_edges],
-            )
-            self.conn.commit()
-
         # Sort by score, take top k, hydrate with text/type
         sorted_results = sorted(results.values(), key=lambda r: r["score"], reverse=True)[:k]
 
@@ -436,6 +444,113 @@ class GraphStore:
                 hydrated.append(r)
 
         return hydrated
+
+    # ------------------------------------------------------------------
+    # Recall tracking
+    # ------------------------------------------------------------------
+
+    def create_recall(self, query_embedding: np.ndarray,
+                      results: list[dict]) -> str:
+        """Store a recall (search event) and its ordered results. Returns recall ID."""
+        recall_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+
+        self.conn.execute(
+            "INSERT INTO recalls (id, query_embedding, created_at) VALUES (?, ?, ?)",
+            (recall_id, embedding_to_blob(query_embedding), now),
+        )
+        for i, r in enumerate(results):
+            self.conn.execute(
+                "INSERT INTO recall_results "
+                "(recall_id, position, node_id, similarity, source, connected_via) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (recall_id, i, r["id"], r.get("similarity", 0.0),
+                 r.get("source", "seed"), r.get("connected_via")),
+            )
+        self.conn.commit()
+        return recall_id
+
+    def rate_recall(self, recall_id: str, ratings: list[str]):
+        """Set rating codes on recall_results by position.
+
+        ratings: list of single-char codes like ['U', 'I', 'N', 'N', 'M'].
+        """
+        for i, code in enumerate(ratings):
+            self.conn.execute(
+                "UPDATE recall_results SET rating = ? "
+                "WHERE recall_id = ? AND position = ?",
+                (code, recall_id, i),
+            )
+        self.conn.commit()
+
+    def get_rated_recalls(self) -> list[dict]:
+        """Return recalls that have at least one rated result, for dream consumption.
+
+        Returns list of dicts with keys: recall_id, query_embedding, results.
+        Each result has: node_id, similarity, source, connected_via, rating.
+        """
+        # Find recall IDs that have at least one non-null rating
+        rated_ids = self.conn.execute(
+            "SELECT DISTINCT recall_id FROM recall_results WHERE rating IS NOT NULL"
+        ).fetchall()
+        if not rated_ids:
+            return []
+
+        recalls = []
+        for (recall_id,) in rated_ids:
+            row = self.conn.execute(
+                "SELECT query_embedding FROM recalls WHERE id = ?",
+                (recall_id,),
+            ).fetchone()
+            if not row:
+                continue
+
+            results = self.conn.execute(
+                "SELECT node_id, similarity, source, connected_via, rating "
+                "FROM recall_results WHERE recall_id = ? ORDER BY position",
+                (recall_id,),
+            ).fetchall()
+
+            recalls.append({
+                "recall_id": recall_id,
+                "query_embedding": blob_to_embedding(row[0]),
+                "results": [
+                    {
+                        "node_id": r[0],
+                        "similarity": r[1],
+                        "source": r[2],
+                        "connected_via": r[3],
+                        "rating": r[4],
+                    }
+                    for r in results
+                ],
+            })
+
+        return recalls
+
+    def clear_rated_recalls(self):
+        """Delete recalls that have been rated (processed by dream)."""
+        rated_ids = self.conn.execute(
+            "SELECT DISTINCT recall_id FROM recall_results WHERE rating IS NOT NULL"
+        ).fetchall()
+        if not rated_ids:
+            return
+
+        ids = [r[0] for r in rated_ids]
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(
+            f"DELETE FROM recall_results WHERE recall_id IN ({placeholders})", ids
+        )
+        self.conn.execute(
+            f"DELETE FROM recalls WHERE id IN ({placeholders})", ids
+        )
+        self.conn.commit()
+
+    def clear_processed_recalls(self):
+        """Delete ALL recalls (rated and unrated) to prevent buildup."""
+        self.conn.execute("DELETE FROM recall_results")
+        self.conn.execute("DELETE FROM recalls")
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Stats

@@ -362,6 +362,11 @@ class GraphSearchRequest(BaseModel):
     node_type: Optional[str] = None
 
 
+class RateRecallRequest(BaseModel):
+    recall_id: str
+    ratings: str  # comma-separated codes like "U,I,N,N,M"
+
+
 class EmbedRequest(BaseModel):
     text: str
 
@@ -646,7 +651,47 @@ async def search_graph(req: GraphSearchRequest):
     if req.node_type:
         results = [r for r in results if r.get("type") == req.node_type]
 
-    return {"results": results}
+    # Store recall for rating feedback
+    recall_id = None
+    if results:
+        recall_id = graph_store.create_recall(
+            np.asarray(query_embedding, dtype=np.float32), results,
+        )
+
+    return {"results": results, "recall_id": recall_id}
+
+
+@app.post("/rate_recall")
+async def rate_recall(req: RateRecallRequest):
+    """Rate the results of a previous graph search recall."""
+    codes = [c.strip() for c in req.ratings.split(",")]
+
+    valid_codes = {"U", "I", "N", "D", "M"}
+    for c in codes:
+        if c not in valid_codes:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid rating code: {c!r}. Valid: {valid_codes}"},
+            )
+
+    # Verify recall exists and check result count
+    row = graph_store.conn.execute(
+        "SELECT COUNT(*) FROM recall_results WHERE recall_id = ?",
+        (req.recall_id,),
+    ).fetchone()
+    if not row or row[0] == 0:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Recall {req.recall_id} not found"},
+        )
+    if len(codes) != row[0]:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Expected {row[0]} ratings, got {len(codes)}"},
+        )
+
+    graph_store.rate_recall(req.recall_id, codes)
+    return {"status": "ok", "recall_id": req.recall_id, "rated": len(codes)}
 
 
 @app.post("/embed")

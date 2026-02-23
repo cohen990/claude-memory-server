@@ -314,8 +314,8 @@ def test_search_with_neighbor_expansion(store):
     assert neighbor_result["connected_via"] == seed_id
 
 
-def test_search_activates_edges(store):
-    """Searching should increment activation counts on traversed edges."""
+def test_search_does_not_activate_edges(store):
+    """Search is a pure read — should NOT increment activation counts."""
     id1 = store.add_node("vibe", "node1", _random_embedding(220))
     id2 = store.add_node("detail", "node2", _random_embedding(221))
     store.add_edge(id1, id2, weight=0.7)
@@ -325,7 +325,7 @@ def test_search_activates_edges(store):
                  k=5, expand_neighbors=True)
 
     activated = store.get_activated_edges()
-    assert len(activated) > 0
+    assert len(activated) == 0
 
 
 def test_search_empty_store(store):
@@ -417,3 +417,144 @@ def test_stats_empty(store):
     s = store.stats()
     assert s["total_nodes"] == 0
     assert s["total_edges"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Recall tracking
+# ---------------------------------------------------------------------------
+
+def test_create_recall(store):
+    """create_recall should store recall + results and return an ID."""
+    emb = _random_embedding(500)
+    id1 = store.add_node("vibe", "node1", _random_embedding(501))
+    id2 = store.add_node("detail", "node2", _random_embedding(502))
+
+    results = [
+        {"id": id1, "similarity": 0.9, "source": "seed"},
+        {"id": id2, "similarity": 0.7, "source": "neighbor", "connected_via": id1},
+    ]
+    recall_id = store.create_recall(emb, results)
+    assert recall_id  # non-empty
+
+    # Verify stored
+    row = store.conn.execute(
+        "SELECT COUNT(*) FROM recall_results WHERE recall_id = ?",
+        (recall_id,),
+    ).fetchone()
+    assert row[0] == 2
+
+
+def test_rate_recall(store):
+    """rate_recall should set rating codes by position."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(510))
+    id2 = store.add_node("vibe", "n2", _random_embedding(511))
+
+    recall_id = store.create_recall(_random_embedding(512), [
+        {"id": id1, "similarity": 0.8, "source": "seed"},
+        {"id": id2, "similarity": 0.6, "source": "seed"},
+    ])
+
+    store.rate_recall(recall_id, ["U", "N"])
+
+    rows = store.conn.execute(
+        "SELECT position, rating FROM recall_results WHERE recall_id = ? ORDER BY position",
+        (recall_id,),
+    ).fetchall()
+    assert rows[0] == (0, "U")
+    assert rows[1] == (1, "N")
+
+
+def test_get_rated_recalls(store):
+    """get_rated_recalls returns only recalls with ratings."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(520))
+    id2 = store.add_node("vibe", "n2", _random_embedding(521))
+
+    # Create two recalls, only rate one
+    emb1 = _random_embedding(522)
+    r1 = store.create_recall(emb1, [
+        {"id": id1, "similarity": 0.9, "source": "seed"},
+    ])
+    store.create_recall(_random_embedding(523), [
+        {"id": id2, "similarity": 0.8, "source": "seed"},
+    ])
+
+    store.rate_recall(r1, ["U"])
+
+    rated = store.get_rated_recalls()
+    assert len(rated) == 1
+    assert rated[0]["recall_id"] == r1
+    assert rated[0]["results"][0]["rating"] == "U"
+    assert rated[0]["results"][0]["node_id"] == id1
+    np.testing.assert_array_almost_equal(rated[0]["query_embedding"], emb1, decimal=5)
+
+
+def test_get_rated_recalls_empty(store):
+    """get_rated_recalls returns empty list when nothing is rated."""
+    assert store.get_rated_recalls() == []
+
+
+def test_clear_rated_recalls(store):
+    """clear_rated_recalls deletes rated recalls but leaves unrated ones."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(530))
+    id2 = store.add_node("vibe", "n2", _random_embedding(531))
+
+    r1 = store.create_recall(_random_embedding(532), [
+        {"id": id1, "similarity": 0.9, "source": "seed"},
+    ])
+    r2 = store.create_recall(_random_embedding(533), [
+        {"id": id2, "similarity": 0.8, "source": "seed"},
+    ])
+
+    store.rate_recall(r1, ["M"])
+    store.clear_rated_recalls()
+
+    # r1 should be gone
+    row = store.conn.execute(
+        "SELECT COUNT(*) FROM recalls WHERE id = ?", (r1,)
+    ).fetchone()
+    assert row[0] == 0
+
+    # r2 should remain
+    row = store.conn.execute(
+        "SELECT COUNT(*) FROM recalls WHERE id = ?", (r2,)
+    ).fetchone()
+    assert row[0] == 1
+
+
+def test_clear_processed_recalls(store):
+    """clear_processed_recalls deletes ALL recalls — rated and unrated."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(540))
+    id2 = store.add_node("vibe", "n2", _random_embedding(541))
+
+    r1 = store.create_recall(_random_embedding(542), [
+        {"id": id1, "similarity": 0.9, "source": "seed"},
+    ])
+    r2 = store.create_recall(_random_embedding(543), [
+        {"id": id2, "similarity": 0.8, "source": "seed"},
+    ])
+
+    # Rate only r1
+    store.rate_recall(r1, ["M"])
+
+    store.clear_processed_recalls()
+
+    # Both should be gone
+    for rid in (r1, r2):
+        row = store.conn.execute(
+            "SELECT COUNT(*) FROM recalls WHERE id = ?", (rid,)
+        ).fetchone()
+        assert row[0] == 0
+
+    # recall_results should be empty too
+    row = store.conn.execute("SELECT COUNT(*) FROM recall_results").fetchone()
+    assert row[0] == 0
+
+
+def test_schema_has_recall_tables(store):
+    """Recall tables should exist after init."""
+    tables = store.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+    table_names = {t[0] for t in tables}
+    assert "recalls" in table_names
+    assert "recall_results" in table_names

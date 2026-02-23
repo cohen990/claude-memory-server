@@ -13,7 +13,6 @@ Usage:
 
 import argparse
 import json
-import math
 import os
 import subprocess
 import sys
@@ -33,7 +32,17 @@ SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
 DREAM_MODEL = os.environ.get("DREAM_MODEL", "sonnet")
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.85"))
 STALENESS_THRESHOLD = float(os.environ.get("STALENESS_THRESHOLD", "0.15"))
-ACTIVATION_WEIGHT_BOOST = float(os.environ.get("ACTIVATION_WEIGHT_BOOST", "0.1"))
+RATING_SCALE = float(os.environ.get("RATING_SCALE", "0.02"))
+RATING_EDGE_FLOOR = 0.05
+RATING_EDGE_CAP = 0.95
+
+RATING_VALUES = {
+    "U": 2,
+    "I": 1,
+    "N": 0,
+    "D": -1,
+    "M": -2,
+}
 
 CHROMA_DIR = os.environ.get("CHROMA_DIR", os.path.expanduser("~/.memory-server/chromadb"))
 COLLECTION_NAME = "conversations"
@@ -42,13 +51,6 @@ COLLECTION_NAME = "conversations"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _compute_weight_boost(old_weight: float, count: int,
-                          boost: float = ACTIVATION_WEIGHT_BOOST,
-                          cap: float = 0.95) -> float:
-    """Compute boosted edge weight using log-weighted activation count."""
-    return min(cap, old_weight + boost * (1 + math.log(count)))
-
 
 def _blend_embeddings(node_emb: np.ndarray,
                       neighbor_embs: list[np.ndarray],
@@ -67,6 +69,22 @@ def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     a_norm = a / np.linalg.norm(a)
     b_norm = b / np.linalg.norm(b)
     return 1.0 - float(np.dot(a_norm, b_norm))
+
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine similarity between two vectors."""
+    a_norm = np.linalg.norm(a)
+    b_norm = np.linalg.norm(b)
+    if a_norm == 0 or b_norm == 0:
+        return 0.0
+    return float(np.dot(a, b) / (a_norm * b_norm))
+
+
+def _apply_rating_delta(old_weight: float, delta: float,
+                        floor: float = RATING_EDGE_FLOOR,
+                        cap: float = RATING_EDGE_CAP) -> float:
+    """Apply a rating-derived delta to an edge weight, clamped to [floor, cap]."""
+    return max(floor, min(cap, old_weight + delta))
 
 
 def embed_text(text: str) -> np.ndarray:
@@ -403,81 +421,121 @@ def cmd_consolidate(args):
 
 
 def cmd_reconsolidate(args):
-    """Process activated edges: boost weights and reconsolidate affected node embeddings."""
+    """Process rated recalls: adjust edge weights and reconsolidate affected embeddings.
+
+    Recalls are the sole signal for edge weight changes. Every search creates
+    a recall; the agent rates it. Only explicitly rated recalls with non-zero
+    rating values affect edge weights. Unrated recalls default to 0 (no effect).
+    """
     graph = GraphStore()
 
-    activated = graph.get_activated_edges()
-    if not activated:
-        print("No activated edges to process.")
-        return
+    # 1. Get rated recalls — the only signal for edge weight changes
+    rated_recalls = graph.get_rated_recalls()
+    edges_adjusted = 0
+    affected_nodes: set[str] = set()
 
-    print(f"Processing {len(activated)} activated edges...")
+    if rated_recalls:
+        print(f"Processing {len(rated_recalls)} rated recalls...")
 
-    # 1. Boost edge weights
-    for edge in activated:
-        count = edge["activation_count"]
-        old_weight = edge["weight"]
-        new_weight = _compute_weight_boost(old_weight, count)
-        graph.update_edge_weight(edge["source_id"], edge["target_id"], new_weight)
-        print(f"  Edge {edge['source_id'][:8]}→{edge['target_id'][:8]}: "
-              f"{old_weight:.2f} → {new_weight:.2f} ({count} activations)")
+        for recall in rated_recalls:
+            query_emb = recall["query_embedding"]
+
+            for result in recall["results"]:
+                rating_code = result.get("rating")
+                if not rating_code or rating_code not in RATING_VALUES:
+                    continue
+
+                rating_value = RATING_VALUES[rating_code]
+                if rating_value == 0:
+                    continue  # NOISE = no change
+
+                node_id = result["node_id"]
+                affected_nodes.add(node_id)
+                edges = graph.get_edges(node_id)
+                if not edges:
+                    continue
+
+                for edge in edges:
+                    neighbor_id = (
+                        edge["target_id"] if edge["source_id"] == node_id
+                        else edge["source_id"]
+                    )
+                    neighbor = graph.get_node(neighbor_id)
+                    if not neighbor:
+                        continue
+
+                    sim = _cosine_sim(query_emb, neighbor["embedding"])
+                    if sim <= 0:
+                        continue  # only adjust edges pointing toward the query
+
+                    delta = rating_value * sim * RATING_SCALE
+                    new_weight = _apply_rating_delta(edge["weight"], delta)
+
+                    if new_weight != edge["weight"]:
+                        graph.update_edge_weight(
+                            edge["source_id"], edge["target_id"], new_weight,
+                        )
+                        edges_adjusted += 1
+                        if abs(delta) >= 0.01:
+                            print(f"  Edge {edge['source_id'][:8]}→{edge['target_id'][:8]}: "
+                                  f"{edge['weight']:.3f} → {new_weight:.3f} "
+                                  f"(rating={rating_code}, sim={sim:.2f})")
+    else:
+        print("No rated recalls to process.")
 
     # 2. Reconsolidate affected node embeddings
-    affected_nodes = set()
-    for edge in activated:
-        affected_nodes.add(edge["source_id"])
-        affected_nodes.add(edge["target_id"])
-
-    print(f"\nReconsolidating {len(affected_nodes)} affected nodes...")
     resynthesized = 0
 
-    for node_id in affected_nodes:
-        node = graph.get_node(node_id)
-        if not node:
-            continue
+    if affected_nodes:
+        print(f"\nReconsolidating {len(affected_nodes)} affected nodes...")
 
-        edges = graph.get_edges(node_id)
-        if not edges:
-            continue
+        for node_id in affected_nodes:
+            node = graph.get_node(node_id)
+            if not node:
+                continue
 
-        # Compute weighted blend of self + neighbors
-        neighbor_embeddings = []
-        neighbor_weights = []
-        neighbor_texts = []
-        for edge in edges:
-            neighbor_id = (
-                edge["target_id"] if edge["source_id"] == node_id
-                else edge["source_id"]
-            )
-            neighbor = graph.get_node(neighbor_id)
-            if neighbor:
-                neighbor_embeddings.append(neighbor["embedding"])
-                neighbor_weights.append(edge["weight"])
-                neighbor_texts.append(neighbor["text"])
+            edges = graph.get_edges(node_id)
+            if not edges:
+                continue
 
-        if not neighbor_embeddings:
-            continue
+            # Compute weighted blend of self + neighbors
+            neighbor_embeddings = []
+            neighbor_weights = []
+            neighbor_texts = []
+            for edge in edges:
+                neighbor_id = (
+                    edge["target_id"] if edge["source_id"] == node_id
+                    else edge["source_id"]
+                )
+                neighbor = graph.get_node(neighbor_id)
+                if neighbor:
+                    neighbor_embeddings.append(neighbor["embedding"])
+                    neighbor_weights.append(edge["weight"])
+                    neighbor_texts.append(neighbor["text"])
 
-        blended = _blend_embeddings(node["embedding"], neighbor_embeddings, neighbor_weights)
-        graph.update_node_embedding(node_id, blended)
+            if not neighbor_embeddings:
+                continue
 
-        # Check staleness: is the text still a good description of the embedding?
-        try:
-            text_embedding = embed_text(node["text"])
-            cosine_dist = _cosine_distance(text_embedding, blended)
+            blended = _blend_embeddings(node["embedding"], neighbor_embeddings, neighbor_weights)
+            graph.update_node_embedding(node_id, blended)
 
-            if cosine_dist > STALENESS_THRESHOLD:
-                print(f"  Node {node_id[:8]}... stale (dist={cosine_dist:.3f}), re-synthesizing text...")
-                new_text = resynthesize_text(node["text"], neighbor_texts)
-                new_embedding = embed_text(new_text)
-                graph.update_node_text(node_id, new_text, new_embedding)
-                resynthesized += 1
-                print(f"    → {new_text[:80]}")
-        except Exception as e:
-            print(f"  Warning: staleness check failed for {node_id[:8]}: {e}")
+            # Check staleness: is the text still a good description of the embedding?
+            try:
+                text_embedding = embed_text(node["text"])
+                cosine_dist = _cosine_distance(text_embedding, blended)
 
-    # 3. Reset activation counts
-    graph.reset_activation_counts()
+                if cosine_dist > STALENESS_THRESHOLD:
+                    print(f"  Node {node_id[:8]}... stale (dist={cosine_dist:.3f}), re-synthesizing text...")
+                    new_text = resynthesize_text(node["text"], neighbor_texts)
+                    new_embedding = embed_text(new_text)
+                    graph.update_node_text(node_id, new_text, new_embedding)
+                    resynthesized += 1
+                    print(f"    → {new_text[:80]}")
+            except Exception as e:
+                print(f"  Warning: staleness check failed for {node_id[:8]}: {e}")
+
+    # 3. Clear all recalls (rated and unrated) to prevent buildup
+    graph.clear_processed_recalls()
 
     # 4. Rebuild cache
     graph._rebuild_cache()
@@ -485,9 +543,9 @@ def cmd_reconsolidate(args):
 
     s = graph.stats()
     print(f"\nReconsolidation complete.")
-    print(f"  Edges boosted: {len(activated)}")
     print(f"  Nodes reconsolidated: {len(affected_nodes)}")
     print(f"  Texts re-synthesized: {resynthesized}")
+    print(f"  Edges adjusted by ratings: {edges_adjusted}")
     print(f"  Total graph: {s['total_nodes']} nodes, {s['total_edges']} edges")
 
 

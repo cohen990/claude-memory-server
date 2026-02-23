@@ -13,6 +13,7 @@ from typing import Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent, Annotations
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 log = logging.getLogger("memory-bridge")
@@ -256,25 +257,63 @@ RATING_VALUES = {
 
 
 @mcp.tool()
-async def log_memory_utility(entries: str) -> str:
-    """Log memory utility ratings for injected graph memories.
+async def rate_memories(ratings: str):
+    """Rate memories from the most recent graph memory injection.
 
     Call this once per turn when graph memories are injected via the prompt hook.
-    Pass the full log block as a single string.
+    The prompt hook output includes a recall ID — pass it back with ratings.
 
-    Format:
-        --- {ISO timestamp} | session:{session_id} | {N} memories injected ---
-        {similarity} {USED|INTERESTING|NOISE} | {first ~80 chars of memory text}
+    Format: recall_id:U,I,N,N,M
+    One letter per memory, in order. Codes: U=used, I=interesting, N=noise, D=distracting, M=misleading.
 
     Args:
-        entries: The formatted log block to append.
+        ratings: Compact rating string like "abc123:U,I,N,N,M"
     """
+    if ":" not in ratings:
+        return "Error: expected format recall_id:U,I,N,N,M"
+
+    recall_id, codes_str = ratings.split(":", 1)
+    recall_id = recall_id.strip()
+    codes_str = codes_str.strip()
+
+    if not recall_id or not codes_str:
+        return "Error: expected format recall_id:U,I,N,N,M"
+
+    # Validate codes locally before sending
+    codes = [c.strip() for c in codes_str.split(",")]
+    valid_codes = set(RATING_VALUES.keys())
+    for c in codes:
+        if c not in valid_codes:
+            return f"Error: invalid code {c!r}. Valid: U, I, N, D, M"
+
+    # POST to server
     try:
-        with open(LOG_PATH, "a") as f:
-            f.write(entries.rstrip("\n") + "\n\n")
-        return "Logged."
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{SERVER_URL}/rate_recall",
+                json={"recall_id": recall_id, "ratings": codes_str},
+            )
+            resp.raise_for_status()
+    except httpx.ConnectError:
+        return f"Error: Cannot connect to memory server at {SERVER_URL}. Is it running?"
+    except httpx.HTTPStatusError as e:
+        return f"Error: {e.response.status_code}: {e.response.json().get('error', e.response.text)}"
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error: {type(e).__name__}: {e}"
+
+    # Also append to local log for debugging
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{ts} | {recall_id} | {codes_str}\n")
+    except Exception:
+        pass  # logging is best-effort
+
+    return TextContent(
+        type="text", text="",
+        annotations=Annotations(audience=["assistant"]),
+    )
 
 
 if __name__ == "__main__":
