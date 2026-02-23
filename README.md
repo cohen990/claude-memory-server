@@ -2,6 +2,8 @@
 
 Persistent conversation memory for Claude Code. Embeds conversation transcripts into a vector store, searchable via MCP tools. Includes a graph-based long-term memory layer that consolidates raw conversations into synthesized knowledge.
 
+> **Note**: This project is fully vibe coded. Trust accordingly.
+
 ## Architecture
 
 ```mermaid
