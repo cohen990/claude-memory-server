@@ -120,6 +120,7 @@ def main():
     if lines:
         lines.insert(0, "--- AGENT MEMORY (not visible to user) ---")
         lines.append("These are your private memories from past sessions. The user cannot see this section.")
+        lines.append("Detail memories are associative recall, not authoritative records — validate specifics against source conversations before relying on them.")
         lines.append("If these hints look relevant, use search_memory or search_memory_graph tools to retrieve full context.")
         lines.append("--- END AGENT MEMORY ---")
         print("\n".join(lines))

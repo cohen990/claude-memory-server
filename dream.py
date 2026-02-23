@@ -131,13 +131,13 @@ def _claude(prompt: str, json_schema: str | None = None) -> str | dict:
         "--model", DREAM_MODEL,
         "--no-session-persistence",
         "--output-format", "json",
-        "--max-turns", "3",
+        "--max-turns", "7",
     ]
     if json_schema:
         cmd.extend(["--json-schema", json_schema])
 
     result = subprocess.run(
-        cmd, input=prompt, capture_output=True, text=True, timeout=120,
+        cmd, input=prompt, capture_output=True, text=True, timeout=300,
     )
     if result.returncode != 0:
         raise RuntimeError(f"claude CLI failed (rc={result.returncode}): {result.stderr[:500]}")
