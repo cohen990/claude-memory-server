@@ -42,10 +42,11 @@ def extract_text(message: dict) -> str:
 
     Handles both string content and list-of-blocks content.
     Skips tool_use, tool_result, and other non-text blocks.
+    Strips <system-reminder> blocks injected by hooks.
     """
     content = message.get("content", "")
     if isinstance(content, str):
-        return content
+        return _strip_system_reminders(content)
     if isinstance(content, list):
         parts = []
         for block in content:
@@ -53,8 +54,17 @@ def extract_text(message: dict) -> str:
                 text = block.get("text", "")
                 if text:
                     parts.append(text)
-        return "\n".join(parts)
+        return _strip_system_reminders("\n".join(parts))
     return ""
+
+
+def _strip_system_reminders(text: str) -> str:
+    """Remove <system-reminder>...</system-reminder> blocks from text."""
+    import re
+    stripped = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL)
+    # Clean up extra whitespace left behind
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip()
 
 
 def chunk_transcript(messages: list[dict]) -> list[dict]:
