@@ -1,0 +1,39 @@
+[project]
+name = "memory-server"
+version = "0.1.0"
+description = "Conversation memory server — ChromaDB + nomic-embed-text-v1.5"
+requires-python = ">=3.10"
+
+dependencies = [
+    "sentence-transformers",
+    "chromadb",
+    "fastapi",
+    "uvicorn[standard]",
+    "numpy",
+    "einops",
+]
+
+[project.optional-dependencies]
+bridge = [
+    "mcp",
+    "httpx",
+]
+sync = [
+    "playwright",
+]
+dev = [
+    "pytest",
+    "httpx",
+]
+
+[tool.setuptools]
+py-modules = [
+    "server",
+    "ingest",
+    "mcp_bridge",
+    "prompt_hook",
+    "batch_import",
+    "claude_sync",
+    "graph",
+    "dream",
+]
