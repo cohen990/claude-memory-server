@@ -109,7 +109,6 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/memory-server
-Environment=EMBED_DEVICE=cpu
 ExecStart=%h/memory-server/.venv/bin/python server.py
 Restart=always
 RestartSec=5
@@ -128,7 +127,7 @@ Enable lingering so the service starts at boot:
 sudo loginctl enable-linger $USER
 ```
 
-Set `EMBED_DEVICE=cpu` if your GPU doesn't support current PyTorch (CUDA compute capability 7.0+).
+The server uses CUDA by default. If your GPU is older (CUDA compute capability below 7.0, e.g. GTX 900 series or earlier), add `Environment=EMBED_DEVICE=cpu` to the service file. CPU embedding is slower but works fine.
 
 ## Setup — Client Machine
 
@@ -312,7 +311,7 @@ curl -X POST http://your-server:8420/search_graph \
 | `INCOMING_DIR` | `~/.memory-server/incoming` | server.py |
 | `GRAPH_DB_PATH` | `~/.memory-server/graph.db` | graph.py |
 | `EMBED_MODEL` | `nomic-ai/nomic-embed-text-v1.5` | server.py |
-| `EMBED_DEVICE` | `cuda` | server.py |
+| `EMBED_DEVICE` | `cuda` | server.py — set to `cpu` for older GPUs (compute capability < 7.0) |
 | `WORKER_INTERVAL` | `2.0` | server.py |
 | `MEMORY_DISTANCE_THRESHOLD` | `0.5` | prompt_hook.py |
 | `MEMORY_MAX_RESULTS` | `5` | prompt_hook.py |
