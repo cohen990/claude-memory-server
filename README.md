@@ -256,27 +256,32 @@ Logs go to `~/.claude-sync/sync.log`. When the session expires (~monthly), re-ru
 The dream pipeline consolidates raw conversations into graph nodes using the Claude CLI (requires `claude` to be installed and authenticated).
 
 ```bash
-# Consolidate last 7 days of conversations into graph nodes
+# Consolidate all un-dreamed conversations into graph nodes
+python dream.py consolidate
+
+# Limit to last 7 days only
 python dream.py consolidate --days 7
 
 # Process activated edges (boost weights, reconsolidate embeddings)
 python dream.py reconsolidate
 
 # Full cycle: consolidate + reconsolidate
-python dream.py full --days 7
+python dream.py full
 
 # View graph statistics
 python dream.py stats
 ```
 
-Chunks are marked after processing — re-running for overlapping date ranges won't reprocess already-consolidated chunks.
+Chunks are marked after processing — re-running won't reprocess already-consolidated chunks.
 
 ### Scheduling
 
-Run nightly via systemd timer or cron:
+The dream pipeline uses `claude -p` (the Claude CLI in non-interactive mode) for synthesis. Make sure `claude` is installed and authenticated on the server machine (`claude login`).
+
+Run nightly via cron:
 
 ```
-0 4 * * * cd ~/memory-server && .venv/bin/python dream.py full --days 1
+0 4 * * * cd ~/memory-server && .venv/bin/python dream.py full >> ~/.claude-sync/dream.log 2>&1
 ```
 
 ## Deployment

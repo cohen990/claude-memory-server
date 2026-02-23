@@ -204,17 +204,14 @@ def cmd_consolidate(args):
     """Read recent conversations from ChromaDB and synthesize into graph nodes."""
     import chromadb
 
-    print(f"Consolidating last {args.days} days of conversations...")
+    if args.days:
+        print(f"Consolidating last {args.days} days of conversations...")
+    else:
+        print("Consolidating all un-dreamed conversations...")
 
     client = chromadb.PersistentClient(path=CHROMA_DIR)
     collection = client.get_or_create_collection(name=COLLECTION_NAME)
 
-    # Calculate cutoff timestamp
-    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
-    cutoff_str = cutoff.isoformat()
-
-    # Fetch un-dreamed documents — ChromaDB $gte only works on numeric fields,
-    # so we filter string timestamps in Python
     total = collection.count()
     if total == 0:
         print("No conversations found.")
@@ -229,19 +226,26 @@ def cmd_consolidate(args):
         limit=total,
     )
 
-    # Filter by timestamp
     docs = []
     ids = []
     metas = []
-    for i, meta in enumerate(results["metadatas"]):
-        ts = meta.get("timestamp", "")
-        if ts >= cutoff_str:
-            docs.append(results["documents"][i])
-            ids.append(results["ids"][i])
-            metas.append(meta)
+
+    if args.days:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+        cutoff_str = cutoff.isoformat()
+        for i, meta in enumerate(results["metadatas"]):
+            ts = meta.get("timestamp", "")
+            if ts >= cutoff_str:
+                docs.append(results["documents"][i])
+                ids.append(results["ids"][i])
+                metas.append(meta)
+    else:
+        docs = results["documents"]
+        ids = results["ids"]
+        metas = results["metadatas"]
 
     if not ids:
-        print("No new conversations found in the specified time range.")
+        print("No un-dreamed conversations found.")
         return
 
     print(f"Found {len(docs)} un-dreamed chunks (of {total} total).")
@@ -501,12 +505,12 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_consolidate = sub.add_parser("consolidate", help="Synthesize recent conversations into graph nodes")
-    p_consolidate.add_argument("--days", type=int, default=7, help="Number of days to look back")
+    p_consolidate.add_argument("--days", type=int, default=None, help="Limit to last N days (default: all un-dreamed)")
 
     p_reconsolidate = sub.add_parser("reconsolidate", help="Process activated edges and reconsolidate embeddings")
 
     p_full = sub.add_parser("full", help="Full dream cycle: consolidate + reconsolidate")
-    p_full.add_argument("--days", type=int, default=7, help="Number of days to look back")
+    p_full.add_argument("--days", type=int, default=None, help="Limit to last N days (default: all un-dreamed)")
 
     p_stats = sub.add_parser("stats", help="Print graph statistics")
 
