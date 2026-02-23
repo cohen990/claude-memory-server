@@ -207,6 +207,10 @@ async def search_memory_graph(
             extras.append(f"edge_weight: {r['edge_weight']:.2f}")
         if r.get("connected_via"):
             extras.append(f"connected_via: {r['connected_via'][:8]}...")
+        source_ids = r.get("source_ids", [])
+        if source_ids:
+            extras.append(f"sources: {', '.join(source_ids[:5])}" +
+                         (f" (+{len(source_ids) - 5} more)" if len(source_ids) > 5 else ""))
 
         meta = " | ".join(extras) if extras else ""
         text = r.get("text", "")

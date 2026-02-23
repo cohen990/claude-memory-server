@@ -427,11 +427,12 @@ class GraphStore:
         hydrated = []
         for r in sorted_results:
             row = self.conn.execute(
-                "SELECT type, text FROM nodes WHERE id = ?", (r["id"],)
+                "SELECT type, text, source_ids FROM nodes WHERE id = ?", (r["id"],)
             ).fetchone()
             if row:
                 r["type"] = row[0]
                 r["text"] = row[1]
+                r["source_ids"] = json.loads(row[2]) if row[2] else []
                 hydrated.append(r)
 
         return hydrated

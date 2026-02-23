@@ -341,6 +341,7 @@ def test_search_returns_hydrated_results(store):
     assert len(results) == 1
     assert results[0]["text"] == "hydrated text"
     assert results[0]["type"] == "vibe"
+    assert results[0]["source_ids"] == ["x"]
     assert "similarity" in results[0]
     assert "score" in results[0]
 
