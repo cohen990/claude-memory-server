@@ -4,34 +4,76 @@ Persistent conversation memory for Claude Code. Embeds conversation transcripts 
 
 ## Architecture
 
-```
-[Claude Code] --Stop hook--> [ingest.py] --HTTP--> [server.py] --embed--> [ChromaDB]
-[Claude Code] --MCP tool---> [mcp_bridge.py] --HTTP--> [server.py] --search--> [ChromaDB]
-[Claude Code] --Prompt hook-> [prompt_hook.py] --HTTP--> [server.py] --search--> [ChromaDB]
-[claude.ai]  --cron--------> [claude_sync.py] --HTTP--> [server.py] --embed--> [ChromaDB]
-[cron]       --nightly------> [dream.py] -----> [graph.py] --sqlite--> [graph.db]
+```mermaid
+graph LR
+    subgraph Client Machine
+        CC[Claude Code]
+        CA[claude.ai]
+    end
+
+    subgraph Hooks & Bridge
+        ING[ingest.py]
+        PH[prompt_hook.py]
+        MCP[mcp_bridge.py]
+    end
+
+    subgraph Server Machine
+        SRV[server.py]
+        DREAM[dream.py]
+        GRAPH[graph.py]
+    end
+
+    subgraph Storage
+        CHROMA[(ChromaDB)]
+        SQLITE[(graph.db)]
+    end
+
+    CC -- "Stop hook" --> ING
+    CC -- "MCP tool" --> MCP
+    CC -- "Prompt hook" --> PH
+
+    ING -- HTTP --> SRV
+    MCP -- HTTP --> SRV
+    PH -- HTTP --> SRV
+
+    SRV -- embed/store --> CHROMA
+    SRV -- search --> CHROMA
+    SRV -- search --> GRAPH
+
+    CA -- "cron sync" --> SRV
+
+    DREAM -- "nightly" --> GRAPH
+    DREAM -- "embed via" --> SRV
+    GRAPH --> SQLITE
 ```
 
 The server can run on a separate machine from Claude Code — all communication is over HTTP. The MCP bridge, hooks, and import scripts run on the same machine as Claude Code and proxy requests to the server.
 
-### Collections
+### Storage
 
-Three ChromaDB collections:
+```mermaid
+graph TD
+    subgraph ChromaDB
+        CONV[conversations<br/><i>full turn pairs</i>]
+        SUB[subchunks<br/><i>~500 char windows</i>]
+        UI[user_inputs<br/><i>user messages only</i>]
+    end
 
-- **conversations** — full turn pairs (user + assistant). Coarse-grained retrieval.
-- **subchunks** — ~500-char rolling windows of turn pairs. Fine-grained retrieval via `search_memory_detail`.
-- **user_inputs** — user messages only. Used by the prompt hook for prompt-to-prompt matching.
+    subgraph Graph Memory
+        V((Vibes<br/><i>themes & patterns</i>))
+        D((Details<br/><i>facts & decisions</i>))
+        V -- "weighted edges" --- D
+        V -- "weighted edges" --- V
+        D -- "weighted edges" --- D
+    end
 
-All search endpoints apply MMR (Maximal Marginal Relevance, lambda=0.7) for diverse results.
+    DREAM[dream.py<br/><i>nightly consolidation</i>]
+    CONV -. "synthesize" .-> DREAM
+    DREAM --> V
+    DREAM --> D
+```
 
-### Graph Memory
-
-A sqlite-backed graph layer stores synthesized long-term memories:
-
-- **Vibes** — high-level themes, patterns, and preferences
-- **Details** — specific facts, decisions, and technical details
-
-Nodes are connected by weighted edges. Search walks the graph neighborhood, and retrieval strengthens associations. A nightly "dream" process (`dream.py`) consolidates raw conversations into graph nodes using Claude CLI.
+All search endpoints apply MMR (Maximal Marginal Relevance, lambda=0.7) for diverse results. Graph search walks the neighborhood and strengthens traversed edges — retrieval itself reinforces associations for the next dream cycle.
 
 ## Setup — Server Machine
 
