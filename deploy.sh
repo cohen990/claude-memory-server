@@ -19,6 +19,10 @@ REMOTE="${DEPLOY_REMOTE:?Set DEPLOY_REMOTE in .env (e.g. user@192.168.1.100)}"
 REMOTE_DIR="${DEPLOY_REMOTE_DIR:-~/memory-server}"
 SERVER_URL="${MEMORY_SERVER_URL:-http://localhost:8420}"
 
+# Build frontend
+echo "Building frontend..."
+(cd "$SCRIPT_DIR/frontend" && npm run build)
+
 echo "Syncing files to $REMOTE..."
 rsync -avz \
   --exclude=__pycache__ \
@@ -27,6 +31,7 @@ rsync -avz \
   --exclude=.venv \
   --exclude=.git \
   --exclude=.env \
+  --exclude=node_modules \
   "$SCRIPT_DIR/" "$REMOTE:$REMOTE_DIR/"
 
 if [[ "${1:-}" == "--restart" ]]; then
@@ -40,6 +45,13 @@ if [[ "${1:-}" == "--restart" ]]; then
     fi
     sleep 2
   done
+
+  # Restart browse UI if its service exists
+  if ssh "$REMOTE" "systemctl --user is-enabled memory-browse" >/dev/null 2>&1; then
+    echo "Restarting browse UI..."
+    ssh "$REMOTE" "systemctl --user restart memory-browse"
+    echo "Browse UI restarted."
+  fi
 fi
 
 echo "Done."

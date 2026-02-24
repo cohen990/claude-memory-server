@@ -121,15 +121,18 @@ async def gather_stats():
 # Static files + SPA fallback
 # ---------------------------------------------------------------------------
 
-static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-if os.path.isdir(static_dir):
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+_base = os.path.dirname(os.path.abspath(__file__))
+dist_dir = os.path.join(_base, "frontend", "dist")
+assets_dir = os.path.join(dist_dir, "assets")
+
+if os.path.isdir(assets_dir):
+    app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
 
 @app.get("/")
 async def index():
     """Serve the SPA shell."""
-    index_path = os.path.join(static_dir, "index.html")
+    index_path = os.path.join(dist_dir, "index.html")
     return FileResponse(index_path, media_type="text/html")
 
 
