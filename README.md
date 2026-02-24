@@ -232,6 +232,17 @@ Codes:
 - M (MISLEADING) — wrong or outdated, actively harmful to have seen
 ```
 
+#### `/memories` skill (optional)
+
+Symlink the skill into your Claude skills directory so users can browse injected memories:
+
+```bash
+mkdir -p ~/.claude/skills/memories
+ln -s /path/to/memory-server/skills/memories/SKILL.md ~/.claude/skills/memories/SKILL.md
+```
+
+Then type `/memories` in Claude Code to see the last injection, or `/memories 3` for the last 3.
+
 Auto-allow the rating tool in `~/.claude/settings.json` so the agent doesn't prompt on every turn:
 
 ```json
@@ -338,7 +349,7 @@ A convenience script is provided: `./deploy.sh [--restart]`. Copy `.env.example`
 
 ```bash
 pip install -e .[dev]
-pytest test_server.py test_graph.py -v
+pytest -v
 ```
 
 Tests spin up isolated instances with temporary storage — no effect on production data.
@@ -386,10 +397,10 @@ curl -X POST http://your-server:8420/search_graph \
 
 **Ingestion**: The Stop hook fires after each Claude response. It reads the hook context from stdin (transcript path), extracts the latest user/assistant turn pair, and POSTs it to the server. The server embeds the text with nomic-embed-text-v1.5 (using the `search_document:` task prefix) and stores it in three collections: the full turn pair, 500-char subchunks, and the user message alone.
 
-**Search**: The MCP bridge exposes `search_memory` (coarse, full turn pairs), `search_memory_detail` (fine, ~500-char subchunks), and `search_memory_graph` (synthesized long-term memories). All vector search uses MMR re-ranking for diversity.
+**Search**: The MCP bridge exposes `search_memory` (coarse, full turn pairs), `search_memory_detail` (fine, ~500-char subchunks), `search_memory_graph` (synthesized long-term memories), and `list_recalls` (view injected memories and ratings for a session). All vector search uses MMR re-ranking for diversity.
 
 **Prompt hook**: Fires on UserPromptSubmit. Searches user_inputs and graph memory, injects compact hints so Claude knows what's relevant without fetching full context. Each graph search creates a recall with a unique ID. These hints are private to the agent — the user doesn't see them.
 
-**Ratings**: The agent rates each recalled memory (U/I/N/D/M) using the `rate_memories` MCP tool. Ratings are stored on the recall and drive edge weight adjustments during the next dream cycle. Unrated recalls have no effect — only explicit ratings change the graph.
+**Ratings**: The agent rates each recalled memory (U/I/N/D/M) using the `rate_memories` MCP tool. Ratings are stored on the recall and drive edge weight adjustments during the next dream cycle. Unrated recalls have no effect — only explicit ratings change the graph. Users can inspect injected memories and their ratings via the `/memories` skill (or the `list_recalls` MCP tool directly).
 
 **Dream pipeline**: Nightly consolidation reads recent conversations, synthesizes them into graph nodes (vibes and details) via Claude CLI, and connects them with weighted edges. Reconsolidation processes rated recalls — adjusting edge weights by `rating_value * cosine_similarity * RATING_SCALE` — then blends node embeddings with their neighbors and re-synthesizes stale text descriptions.

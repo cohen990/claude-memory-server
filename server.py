@@ -360,6 +360,12 @@ class GraphSearchRequest(BaseModel):
     k: int = 10
     expand_neighbors: bool = True
     node_type: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class ListRecallsRequest(BaseModel):
+    session_id: Optional[str] = None
+    limit: int = 1
 
 
 class RateRecallRequest(BaseModel):
@@ -656,6 +662,7 @@ async def search_graph(req: GraphSearchRequest):
     if results:
         recall_id = graph_store.create_recall(
             np.asarray(query_embedding, dtype=np.float32), results,
+            session_id=req.session_id,
         )
 
     return {"results": results, "recall_id": recall_id}
@@ -692,6 +699,15 @@ async def rate_recall(req: RateRecallRequest):
 
     graph_store.rate_recall(req.recall_id, codes)
     return {"status": "ok", "recall_id": req.recall_id, "rated": len(codes)}
+
+
+@app.post("/list_recalls")
+async def list_recalls(req: ListRecallsRequest):
+    """List recent recalls with full details for the /memories skill."""
+    recalls = graph_store.list_recalls(
+        session_id=req.session_id, limit=req.limit,
+    )
+    return {"recalls": recalls}
 
 
 @app.post("/embed")

@@ -245,9 +245,65 @@ async def memory_stats() -> str:
     return "\n".join(lines)
 
 
-LOG_PATH = os.path.expanduser("~/.claude/memory_utility.log")
+@mcp.tool()
+async def list_recalls(session_id: str, limit: int = 1) -> str:
+    """List recent memory recalls for a session, with full details and ratings.
 
-RATING_VALUES = {
+    Shows what memories were injected by the prompt hook and how they were rated.
+    Use with the /memories skill to let the user see their memory activity.
+
+    Args:
+        session_id: The session ID to filter recalls for.
+        limit: Number of recent recalls to return (default 1).
+    """
+    body = {"session_id": session_id, "limit": limit}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{SERVER_URL}/list_recalls", json=body)
+            resp.raise_for_status()
+    except httpx.ConnectError:
+        return f"Error: Cannot connect to memory server at {SERVER_URL}. Is it running?"
+    except httpx.HTTPStatusError as e:
+        return f"Error: Memory server returned {e.response.status_code}: {e.response.text}"
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+
+    data = resp.json()
+    recalls = data.get("recalls", [])
+
+    if not recalls:
+        return "No recalls found for this session."
+
+    rating_labels = {
+        "U": "USED", "I": "INTERESTING", "N": "NOISE",
+        "D": "DISTRACTING", "M": "MISLEADING",
+    }
+
+    parts = []
+    for recall in recalls:
+        ts = recall.get("created_at", "?")
+        rid = recall.get("recall_id", "?")
+        results = recall.get("results", [])
+
+        lines = [f"=== Recall {rid[:12]}... at {ts} ==="]
+        for i, r in enumerate(results, 1):
+            ntype = r.get("type", "?")
+            sim = r.get("similarity", 0)
+            text = (r.get("text") or "")[:150]
+            rating = r.get("rating")
+            source = r.get("source", "seed")
+
+            rating_str = f" [{rating} = {rating_labels.get(rating, '?')}]" if rating else " [unrated]"
+            lines.append(f"  {i}. [{ntype}] (sim: {sim:.2f}, via: {source}){rating_str}")
+            lines.append(f"     {text}")
+
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)
+
+
+RATING_LABELS = {
     "U": ("USED", 2),
     "I": ("INTERESTING", 1),
     "N": ("NOISE", 0),
@@ -281,7 +337,7 @@ async def rate_memories(ratings: str):
 
     # Validate codes locally before sending
     codes = [c.strip() for c in codes_str.split(",")]
-    valid_codes = set(RATING_VALUES.keys())
+    valid_codes = set(RATING_LABELS.keys())
     for c in codes:
         if c not in valid_codes:
             return f"Error: invalid code {c!r}. Valid: U, I, N, D, M"
@@ -300,15 +356,6 @@ async def rate_memories(ratings: str):
         return f"Error: {e.response.status_code}: {e.response.json().get('error', e.response.text)}"
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}"
-
-    # Also append to local log for debugging
-    try:
-        from datetime import datetime, timezone
-        ts = datetime.now(timezone.utc).isoformat()
-        with open(LOG_PATH, "a") as f:
-            f.write(f"{ts} | {recall_id} | {codes_str}\n")
-    except Exception:
-        pass  # logging is best-effort
 
     return TextContent(
         type="text", text="",

@@ -558,3 +558,198 @@ def test_schema_has_recall_tables(store):
     table_names = {t[0] for t in tables}
     assert "recalls" in table_names
     assert "recall_results" in table_names
+
+
+# ---------------------------------------------------------------------------
+# session_id on recalls
+# ---------------------------------------------------------------------------
+
+def test_create_recall_with_session_id(store):
+    """create_recall should store session_id when provided."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(600))
+    recall_id = store.create_recall(
+        _random_embedding(601),
+        [{"id": id1, "similarity": 0.9, "source": "seed"}],
+        session_id="sess-abc-123",
+    )
+
+    row = store.conn.execute(
+        "SELECT session_id FROM recalls WHERE id = ?", (recall_id,)
+    ).fetchone()
+    assert row[0] == "sess-abc-123"
+
+
+def test_create_recall_without_session_id(store):
+    """create_recall should store NULL session_id when not provided."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(610))
+    recall_id = store.create_recall(
+        _random_embedding(611),
+        [{"id": id1, "similarity": 0.9, "source": "seed"}],
+    )
+
+    row = store.conn.execute(
+        "SELECT session_id FROM recalls WHERE id = ?", (recall_id,)
+    ).fetchone()
+    assert row[0] is None
+
+
+# ---------------------------------------------------------------------------
+# list_recalls
+# ---------------------------------------------------------------------------
+
+def test_list_recalls_by_session(store):
+    """list_recalls should return recalls filtered by session_id."""
+    id1 = store.add_node("vibe", "vibe text", _random_embedding(620))
+    id2 = store.add_node("detail", "detail text", _random_embedding(621))
+
+    # Create recall for session A
+    r1 = store.create_recall(
+        _random_embedding(622),
+        [{"id": id1, "similarity": 0.9, "source": "seed"}],
+        session_id="session-A",
+    )
+    # Create recall for session B
+    store.create_recall(
+        _random_embedding(623),
+        [{"id": id2, "similarity": 0.8, "source": "seed"}],
+        session_id="session-B",
+    )
+
+    recalls = store.list_recalls(session_id="session-A", limit=10)
+    assert len(recalls) == 1
+    assert recalls[0]["recall_id"] == r1
+    assert recalls[0]["session_id"] == "session-A"
+
+
+def test_list_recalls_joins_node_data(store):
+    """list_recalls results should include node type and text."""
+    id1 = store.add_node("vibe", "my vibe text", _random_embedding(630))
+
+    store.create_recall(
+        _random_embedding(631),
+        [{"id": id1, "similarity": 0.85, "source": "seed"}],
+        session_id="session-X",
+    )
+
+    recalls = store.list_recalls(session_id="session-X")
+    assert len(recalls) == 1
+    r = recalls[0]["results"][0]
+    assert r["type"] == "vibe"
+    assert r["text"] == "my vibe text"
+    assert r["similarity"] == pytest.approx(0.85)
+    assert r["source"] == "seed"
+
+
+def test_list_recalls_includes_ratings(store):
+    """list_recalls should show ratings after rate_recall is called."""
+    id1 = store.add_node("detail", "detail node", _random_embedding(640))
+    id2 = store.add_node("vibe", "vibe node", _random_embedding(641))
+
+    recall_id = store.create_recall(
+        _random_embedding(642),
+        [
+            {"id": id1, "similarity": 0.9, "source": "seed"},
+            {"id": id2, "similarity": 0.7, "source": "neighbor", "connected_via": id1},
+        ],
+        session_id="session-Y",
+    )
+    store.rate_recall(recall_id, ["U", "N"])
+
+    recalls = store.list_recalls(session_id="session-Y")
+    assert len(recalls) == 1
+    assert recalls[0]["results"][0]["rating"] == "U"
+    assert recalls[0]["results"][1]["rating"] == "N"
+
+
+def test_list_recalls_limit(store):
+    """list_recalls should respect the limit parameter."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(650))
+
+    for i in range(5):
+        store.create_recall(
+            _random_embedding(660 + i),
+            [{"id": id1, "similarity": 0.8, "source": "seed"}],
+            session_id="session-Z",
+        )
+
+    recalls = store.list_recalls(session_id="session-Z", limit=2)
+    assert len(recalls) == 2
+
+
+def test_list_recalls_no_session_filter(store):
+    """list_recalls without session_id returns most recent across all sessions."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(670))
+
+    store.create_recall(
+        _random_embedding(671),
+        [{"id": id1, "similarity": 0.9, "source": "seed"}],
+        session_id="sess-1",
+    )
+    store.create_recall(
+        _random_embedding(672),
+        [{"id": id1, "similarity": 0.8, "source": "seed"}],
+        session_id="sess-2",
+    )
+
+    recalls = store.list_recalls(limit=10)
+    assert len(recalls) == 2
+
+
+def test_list_recalls_empty(store):
+    """list_recalls returns empty list when no recalls exist."""
+    assert store.list_recalls(session_id="nonexistent") == []
+
+
+def test_migrate_adds_session_id(tmp_path):
+    """Migration should add session_id column to an existing DB without it."""
+    db_path = str(tmp_path / "migrate_test.db")
+
+    # Create a DB with the old schema (no session_id)
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE recalls (
+            id TEXT PRIMARY KEY,
+            query_embedding BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE recall_results (
+            recall_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            node_id TEXT NOT NULL,
+            similarity REAL NOT NULL,
+            source TEXT NOT NULL,
+            connected_via TEXT,
+            rating TEXT,
+            PRIMARY KEY (recall_id, position)
+        );
+        CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            text TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            source_ids TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE edges (
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 0.5,
+            created_at TEXT NOT NULL,
+            last_activated TEXT,
+            activation_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source_id, target_id)
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    # Open with GraphStore — migration should add session_id
+    gs = GraphStore(db_path=db_path)
+    cols = {
+        row[1] for row in
+        gs.conn.execute("PRAGMA table_info(recalls)").fetchall()
+    }
+    assert "session_id" in cols
+    gs.close()

@@ -76,7 +76,8 @@ class GraphStore:
             CREATE TABLE IF NOT EXISTS recalls (
                 id TEXT PRIMARY KEY,
                 query_embedding BLOB NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                session_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS recall_results (
@@ -100,7 +101,18 @@ class GraphStore:
             )
         except sqlite3.OperationalError:
             pass  # partial indexes not supported on all builds
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        """Run schema migrations for columns added after initial release."""
+        # Add session_id to recalls table (added for /memories skill)
+        cols = {
+            row[1] for row in
+            self.conn.execute("PRAGMA table_info(recalls)").fetchall()
+        }
+        if "session_id" not in cols:
+            self.conn.execute("ALTER TABLE recalls ADD COLUMN session_id TEXT")
 
     def _rebuild_cache(self):
         """Load all node embeddings into a pre-normalized numpy matrix."""
@@ -450,14 +462,16 @@ class GraphStore:
     # ------------------------------------------------------------------
 
     def create_recall(self, query_embedding: np.ndarray,
-                      results: list[dict]) -> str:
+                      results: list[dict],
+                      session_id: str | None = None) -> str:
         """Store a recall (search event) and its ordered results. Returns recall ID."""
         recall_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
         self.conn.execute(
-            "INSERT INTO recalls (id, query_embedding, created_at) VALUES (?, ?, ?)",
-            (recall_id, embedding_to_blob(query_embedding), now),
+            "INSERT INTO recalls (id, query_embedding, created_at, session_id) "
+            "VALUES (?, ?, ?, ?)",
+            (recall_id, embedding_to_blob(query_embedding), now, session_id),
         )
         for i, r in enumerate(results):
             self.conn.execute(
@@ -521,6 +535,58 @@ class GraphStore:
                         "source": r[2],
                         "connected_via": r[3],
                         "rating": r[4],
+                    }
+                    for r in results
+                ],
+            })
+
+        return recalls
+
+    def list_recalls(self, session_id: str | None = None,
+                     limit: int = 1) -> list[dict]:
+        """Return recent recalls with full details for display.
+
+        Joins recalls → recall_results → nodes, ordered by created_at DESC.
+        Returns list of dicts with keys: recall_id, created_at, session_id,
+        results (each with node_id, type, text, similarity, source, rating).
+        """
+        if session_id:
+            rows = self.conn.execute(
+                "SELECT id, created_at, session_id FROM recalls "
+                "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT id, created_at, session_id FROM recalls "
+                "ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+        recalls = []
+        for recall_id, created_at, sess_id in rows:
+            results = self.conn.execute(
+                "SELECT rr.node_id, rr.similarity, rr.source, "
+                "rr.connected_via, rr.rating, n.type, n.text "
+                "FROM recall_results rr "
+                "LEFT JOIN nodes n ON rr.node_id = n.id "
+                "WHERE rr.recall_id = ? ORDER BY rr.position",
+                (recall_id,),
+            ).fetchall()
+
+            recalls.append({
+                "recall_id": recall_id,
+                "created_at": created_at,
+                "session_id": sess_id,
+                "results": [
+                    {
+                        "node_id": r[0],
+                        "similarity": r[1],
+                        "source": r[2],
+                        "connected_via": r[3],
+                        "rating": r[4],
+                        "type": r[5],
+                        "text": r[6],
                     }
                     for r in results
                 ],

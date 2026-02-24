@@ -17,12 +17,14 @@ import urllib.error
 SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
 
 
-def search_graph(query: str, k: int = 5) -> dict:
+def search_graph(query: str, k: int = 5, session_id: str = "") -> dict:
     """Search the graph memory layer for synthesized long-term memories.
 
     Returns {"results": [...], "recall_id": str|None}.
     """
     body = {"q": query, "k": k, "expand_neighbors": True}
+    if session_id:
+        body["session_id"] = session_id
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         f"{SERVER_URL}/search_graph",
@@ -53,8 +55,8 @@ def main():
 
     current_session = hook_input.get("session_id", "")
 
-    # Graph memory search
-    graph_data = search_graph(prompt, k=5)
+    # Graph memory search — pass session_id so recalls are tagged
+    graph_data = search_graph(prompt, k=5, session_id=current_session)
     graph_results = graph_data.get("results", [])
     recall_id = graph_data.get("recall_id")
     graph_relevant = [r for r in graph_results if r.get("similarity", 0) > 0.5]
