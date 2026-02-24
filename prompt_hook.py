@@ -39,6 +39,28 @@ def search_graph(query: str, k: int = 5, session_id: str = "") -> dict:
         return {"results": [], "recall_id": None}
 
 
+def get_last_assistant_text(transcript_path: str) -> str:
+    """Read the transcript and return the last assistant message text.
+
+    Used to give the graph search more context than just the user's bare prompt.
+    """
+    if not transcript_path:
+        return ""
+    try:
+        from ingest import read_transcript, extract_text
+        messages = read_transcript(transcript_path)
+        # Walk backwards to find the last assistant message
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                text = extract_text(msg)
+                if text:
+                    # Truncate — we just need enough for context, not the whole response
+                    return text[:500]
+        return ""
+    except Exception:
+        return ""
+
+
 def main():
     try:
         hook_input = json.loads(sys.stdin.read())
@@ -55,8 +77,16 @@ def main():
 
     current_session = hook_input.get("session_id", "")
 
+    # Build search query from user prompt + previous assistant context
+    transcript_path = hook_input.get("transcript_path", "")
+    prev_context = get_last_assistant_text(transcript_path)
+    if prev_context:
+        query = prev_context + "\n\n" + prompt
+    else:
+        query = prompt
+
     # Graph memory search — pass session_id so recalls are tagged
-    graph_data = search_graph(prompt, k=5, session_id=current_session)
+    graph_data = search_graph(query, k=5, session_id=current_session)
     graph_results = graph_data.get("results", [])
     recall_id = graph_data.get("recall_id")
     graph_relevant = [r for r in graph_results if r.get("similarity", 0) > 0.5]
@@ -86,7 +116,7 @@ def main():
     lines.append("Detail memories are associative recall, not authoritative records — validate specifics against source conversations before relying on them.")
     lines.append("Use search_memory or search_memory_detail tools with session_id to retrieve full source conversations.")
     if recall_id:
-        lines.append(f"Rate these memories using rate_memories tool: {recall_id}:U,I,N,N,M (one code per memory above, in order)")
+        lines.append(f"Reflect on these memories using the reflect tool: {recall_id}:U,I,N,N,M (one code per memory above, in order)")
     lines.append("--- END AGENT MEMORY ---")
     print("\n".join(lines))
 

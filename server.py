@@ -368,9 +368,9 @@ class ListRecallsRequest(BaseModel):
     limit: int = 1
 
 
-class RateRecallRequest(BaseModel):
+class ReflectOnRecallRequest(BaseModel):
     recall_id: str
-    ratings: str  # comma-separated codes like "U,I,N,N,M"
+    reflections: str  # comma-separated codes like "U,I,N,N,M"
 
 
 class EmbedRequest(BaseModel):
@@ -657,28 +657,28 @@ async def search_graph(req: GraphSearchRequest):
     if req.node_type:
         results = [r for r in results if r.get("type") == req.node_type]
 
-    # Store recall for rating feedback
+    # Store recall for reflection feedback
     recall_id = None
     if results:
         recall_id = graph_store.create_recall(
             np.asarray(query_embedding, dtype=np.float32), results,
-            session_id=req.session_id,
+            session_id=req.session_id, query_text=req.q,
         )
 
     return {"results": results, "recall_id": recall_id}
 
 
-@app.post("/rate_recall")
-async def rate_recall(req: RateRecallRequest):
-    """Rate the results of a previous graph search recall."""
-    codes = [c.strip() for c in req.ratings.split(",")]
+@app.post("/reflect_on_recall")
+async def reflect_on_recall(req: ReflectOnRecallRequest):
+    """Record reflections on the results of a previous graph search recall."""
+    codes = [c.strip() for c in req.reflections.split(",")]
 
     valid_codes = {"U", "I", "N", "D", "M"}
     for c in codes:
         if c not in valid_codes:
             return JSONResponse(
                 status_code=400,
-                content={"error": f"Invalid rating code: {c!r}. Valid: {valid_codes}"},
+                content={"error": f"Invalid reflection code: {c!r}. Valid: {valid_codes}"},
             )
 
     # Verify recall exists and check result count
@@ -694,11 +694,11 @@ async def rate_recall(req: RateRecallRequest):
     if len(codes) != row[0]:
         return JSONResponse(
             status_code=400,
-            content={"error": f"Expected {row[0]} ratings, got {len(codes)}"},
+            content={"error": f"Expected {row[0]} reflections, got {len(codes)}"},
         )
 
-    graph_store.rate_recall(req.recall_id, codes)
-    return {"status": "ok", "recall_id": req.recall_id, "rated": len(codes)}
+    graph_store.reflect_on_recall(req.recall_id, codes)
+    return {"status": "ok", "recall_id": req.recall_id, "reflected": len(codes)}
 
 
 @app.post("/list_recalls")
@@ -727,6 +727,83 @@ async def reload_graph_cache():
     return {"status": "ok", "nodes": s["total_nodes"], "edges": s["total_edges"]}
 
 
+# ---------------------------------------------------------------------------
+# Graph browse endpoints (read-only, used by browse.py)
+# ---------------------------------------------------------------------------
+
+@app.get("/graph/full")
+async def graph_full(
+    node_limit: int = Query(2000, ge=1),
+    edge_limit: int = Query(5000, ge=1),
+):
+    """Full graph for Cytoscape.js initial load."""
+    return graph_store.get_full_graph(node_limit=node_limit, edge_limit=edge_limit)
+
+
+@app.get("/graph/nodes")
+async def graph_list_nodes(
+    type: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Paginated node listing."""
+    return graph_store.list_nodes(node_type=type, limit=limit, offset=offset)
+
+
+@app.get("/graph/nodes/{node_id}")
+async def graph_get_node(node_id: str):
+    """Single node with edges, no embedding."""
+    node = graph_store.get_node(node_id)
+    if not node:
+        return JSONResponse(status_code=404, content={"error": "Node not found"})
+    node.pop("embedding", None)
+    edges = graph_store.get_edges(node_id)
+    return {"node": node, "edges": edges}
+
+
+@app.get("/graph/nodes/{node_id}/neighbors")
+async def graph_get_neighbors(node_id: str):
+    """Edges + hydrated neighbor nodes."""
+    node = graph_store.get_node(node_id)
+    if not node:
+        return JSONResponse(status_code=404, content={"error": "Node not found"})
+
+    edges = graph_store.get_edges(node_id)
+    neighbors = []
+    for edge in edges:
+        neighbor_id = (
+            edge["target_id"] if edge["source_id"] == node_id
+            else edge["source_id"]
+        )
+        neighbor = graph_store.get_node(neighbor_id)
+        if neighbor:
+            neighbor.pop("embedding", None)
+            neighbors.append({"node": neighbor, "edge": edge})
+
+    return {"neighbors": neighbors}
+
+
+@app.get("/graph/recalls")
+async def graph_list_recalls(
+    session_id: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Recent recalls with full details."""
+    return {"recalls": graph_store.list_recalls(session_id=session_id, limit=limit)}
+
+
+@app.get("/graph/reflections")
+async def graph_reflection_distribution():
+    """Reflection distribution across all recalls."""
+    return graph_store.reflection_distribution()
+
+
+@app.get("/graph/reflection-timeline")
+async def graph_reflection_timeline():
+    """Reflection counts bucketed by hour for timeline chart."""
+    return graph_store.reflection_timeline()
+
+
 @app.get("/stats")
 async def stats():
     """Return collection statistics."""
@@ -736,6 +813,7 @@ async def stats():
     failed = len(list(failed_dir.glob("*.json"))) if failed_dir.exists() else 0
 
     gs = graph_store.stats() if graph_store else {}
+    pending_dream = graph_store.pending_dream_count() if graph_store else 0
 
     return {
         "total_documents": collection.count(),
@@ -751,6 +829,7 @@ async def stats():
         "graph_details": gs.get("nodes_by_type", {}).get("detail", 0),
         "graph_edges": gs.get("total_edges", 0),
         "graph_activated_edges": gs.get("activated_edges", 0),
+        "pending_dream": pending_dream,
     }
 
 

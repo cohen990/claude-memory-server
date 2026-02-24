@@ -32,11 +32,11 @@ SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
 DREAM_MODEL = os.environ.get("DREAM_MODEL", "sonnet")
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.85"))
 STALENESS_THRESHOLD = float(os.environ.get("STALENESS_THRESHOLD", "0.15"))
-RATING_SCALE = float(os.environ.get("RATING_SCALE", "0.02"))
-RATING_EDGE_FLOOR = 0.05
-RATING_EDGE_CAP = 0.95
+REFLECTION_SCALE = float(os.environ.get("REFLECTION_SCALE", "0.02"))
+REFLECTION_EDGE_FLOOR = 0.05
+REFLECTION_EDGE_CAP = 0.95
 
-RATING_VALUES = {
+REFLECTION_VALUES = {
     "U": 2,
     "I": 1,
     "N": 0,
@@ -80,10 +80,10 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (a_norm * b_norm))
 
 
-def _apply_rating_delta(old_weight: float, delta: float,
-                        floor: float = RATING_EDGE_FLOOR,
-                        cap: float = RATING_EDGE_CAP) -> float:
-    """Apply a rating-derived delta to an edge weight, clamped to [floor, cap]."""
+def _apply_reflection_delta(old_weight: float, delta: float,
+                            floor: float = REFLECTION_EDGE_FLOOR,
+                            cap: float = REFLECTION_EDGE_CAP) -> float:
+    """Apply a reflection-derived delta to an edge weight, clamped to [floor, cap]."""
     return max(floor, min(cap, old_weight + delta))
 
 
@@ -151,9 +151,11 @@ SYNTHESIS_SCHEMA = json.dumps({
                     "from_type": {"type": "string"},
                     "to_idx": {"type": "integer"},
                     "to_type": {"type": "string"},
+                    "from_existing_idx": {"type": "integer"},
+                    "to_existing_idx": {"type": "integer"},
                     "weight": {"type": "number"},
                 },
-                "required": ["from_idx", "from_type", "to_idx", "to_type", "weight"],
+                "required": ["weight"],
             },
         },
     },
@@ -198,11 +200,9 @@ def _claude(prompt: str, json_schema: str | None = None) -> str | dict:
     return envelope.get("result", "")
 
 
-def synthesize(chunks: list[str]) -> dict:
-    """Send chunks to Claude CLI for synthesis into vibes and details.
-
-    Returns: {"vibes": [...], "details": [...], "connections": [...]}
-    """
+def _build_synthesis_prompt(chunks: list[str],
+                            recalled_nodes: list[dict] | None = None) -> str:
+    """Build the synthesis prompt from chunks and optional recalled nodes."""
     combined = "\n\n---\n\n".join(chunks)
 
     prompt = f"""Analyze these conversation excerpts and synthesize them into long-term memory nodes.
@@ -220,6 +220,28 @@ Conversation excerpts:
 
 {combined}"""
 
+    if recalled_nodes:
+        prompt += "\n\nExisting memories that were recalled during these conversations:\n\n"
+        for i, node in enumerate(recalled_nodes):
+            prompt += f'[{i}] ({node["type"]}, id={node["id"]}) "{node["text"]}"\n'
+        prompt += """
+You may suggest connections between new nodes you create and these existing nodes.
+For connections to existing nodes, use "from_existing_idx" or "to_existing_idx" (0-indexed into the list above) instead of "from_idx"/"from_type" or "to_idx"/"to_type" for that side of the connection.
+A connection can link two new nodes, a new node to an existing node, or an existing node to a new node."""
+
+    return prompt
+
+
+def synthesize(chunks: list[str],
+               recalled_nodes: list[dict] | None = None) -> dict:
+    """Send chunks to Claude CLI for synthesis into vibes and details.
+
+    When recalled_nodes is provided, includes them as context so Claude can
+    suggest cross-temporal connections between new and existing nodes.
+
+    Returns: {"vibes": [...], "details": [...], "connections": [...]}
+    """
+    prompt = _build_synthesis_prompt(chunks, recalled_nodes)
     # _claude returns parsed dict when json_schema is provided
     return _claude(prompt, json_schema=SYNTHESIS_SCHEMA)
 
@@ -307,8 +329,19 @@ def cmd_consolidate(args):
         batch_metas = metas[batch_start:batch_start + batch_size]
         print(f"\nProcessing batch {batch_start // batch_size + 1} ({len(batch_docs)} chunks)...")
 
+        # Collect session IDs from this batch and fetch recalled nodes
+        batch_session_ids = list({
+            m["session_id"] for m in batch_metas
+            if m.get("session_id")
+        })
+        recalled_nodes = []
+        if batch_session_ids:
+            recalled_nodes = graph.get_recalled_nodes_for_sessions(batch_session_ids)
+            if recalled_nodes:
+                print(f"  Found {len(recalled_nodes)} recalled nodes from {len(batch_session_ids)} sessions")
+
         try:
-            synthesis = synthesize(batch_docs)
+            synthesis = synthesize(batch_docs, recalled_nodes=recalled_nodes or None)
         except Exception as e:
             print(f"  Synthesis error: {e}")
             continue
@@ -381,26 +414,41 @@ def cmd_consolidate(args):
             except Exception:
                 all_nodes.append(("detail", None))
 
+        # Build lookup for existing (recalled) nodes
+        existing_node_ids = [n["id"] for n in recalled_nodes]
+
         for conn in synthesis.get("connections", []):
-            from_type = conn.get("from_type", "vibe")
-            to_type = conn.get("to_type", "detail")
-            from_idx = conn.get("from_idx", 0)
-            to_idx = conn.get("to_idx", 0)
             weight = conn.get("weight", 0.5)
+            from_id = None
+            to_id = None
 
-            # Map indices to the all_nodes list
-            vibes_list = [(i, n) for i, (t, n) in enumerate(all_nodes) if t == "vibe"]
-            details_list = [(i, n) for i, (t, n) in enumerate(all_nodes) if t == "detail"]
+            # Resolve "from" side
+            if "from_existing_idx" in conn:
+                idx = conn["from_existing_idx"]
+                if 0 <= idx < len(existing_node_ids):
+                    from_id = existing_node_ids[idx]
+            elif "from_idx" in conn and "from_type" in conn:
+                from_type = conn["from_type"]
+                from_idx = conn["from_idx"]
+                typed_nodes = [(i, n) for i, (t, n) in enumerate(all_nodes) if t == from_type]
+                if from_idx < len(typed_nodes):
+                    from_id = typed_nodes[from_idx][1]
 
-            from_nodes = vibes_list if from_type == "vibe" else details_list
-            to_nodes = details_list if to_type == "detail" else vibes_list
+            # Resolve "to" side
+            if "to_existing_idx" in conn:
+                idx = conn["to_existing_idx"]
+                if 0 <= idx < len(existing_node_ids):
+                    to_id = existing_node_ids[idx]
+            elif "to_idx" in conn and "to_type" in conn:
+                to_type = conn["to_type"]
+                to_idx = conn["to_idx"]
+                typed_nodes = [(i, n) for i, (t, n) in enumerate(all_nodes) if t == to_type]
+                if to_idx < len(typed_nodes):
+                    to_id = typed_nodes[to_idx][1]
 
-            if from_idx < len(from_nodes) and to_idx < len(to_nodes):
-                from_id = from_nodes[from_idx][1]
-                to_id = to_nodes[to_idx][1]
-                if from_id and to_id:
-                    graph.add_edge(from_id, to_id, weight=weight)
-                    total_edges += 1
+            if from_id and to_id:
+                graph.add_edge(from_id, to_id, weight=weight)
+                total_edges += 1
 
         # Mark batch chunks as dreamed so they won't be reprocessed
         # ChromaDB update() replaces metadata entirely, so carry forward existing fields
@@ -421,32 +469,32 @@ def cmd_consolidate(args):
 
 
 def cmd_reconsolidate(args):
-    """Process rated recalls: adjust edge weights and reconsolidate affected embeddings.
+    """Process reflected recalls: adjust edge weights and reconsolidate affected embeddings.
 
     Recalls are the sole signal for edge weight changes. Every search creates
-    a recall; the agent rates it. Only explicitly rated recalls with non-zero
-    rating values affect edge weights. Unrated recalls default to 0 (no effect).
+    a recall; the agent reflects on it. Only explicitly reflected recalls with non-zero
+    reflection values affect edge weights. Unreflected recalls default to 0 (no effect).
     """
     graph = GraphStore()
 
-    # 1. Get rated recalls — the only signal for edge weight changes
-    rated_recalls = graph.get_rated_recalls()
+    # 1. Get reflected recalls — the only signal for edge weight changes
+    reflected_recalls = graph.get_reflected_recalls()
     edges_adjusted = 0
     affected_nodes: set[str] = set()
 
-    if rated_recalls:
-        print(f"Processing {len(rated_recalls)} rated recalls...")
+    if reflected_recalls:
+        print(f"Processing {len(reflected_recalls)} reflected recalls...")
 
-        for recall in rated_recalls:
+        for recall in reflected_recalls:
             query_emb = recall["query_embedding"]
 
             for result in recall["results"]:
-                rating_code = result.get("rating")
-                if not rating_code or rating_code not in RATING_VALUES:
+                reflection_code = result.get("reflection")
+                if not reflection_code or reflection_code not in REFLECTION_VALUES:
                     continue
 
-                rating_value = RATING_VALUES[rating_code]
-                if rating_value == 0:
+                reflection_value = REFLECTION_VALUES[reflection_code]
+                if reflection_value == 0:
                     continue  # NOISE = no change
 
                 node_id = result["node_id"]
@@ -468,8 +516,8 @@ def cmd_reconsolidate(args):
                     if sim <= 0:
                         continue  # only adjust edges pointing toward the query
 
-                    delta = rating_value * sim * RATING_SCALE
-                    new_weight = _apply_rating_delta(edge["weight"], delta)
+                    delta = reflection_value * sim * REFLECTION_SCALE
+                    new_weight = _apply_reflection_delta(edge["weight"], delta)
 
                     if new_weight != edge["weight"]:
                         graph.update_edge_weight(
@@ -479,9 +527,9 @@ def cmd_reconsolidate(args):
                         if abs(delta) >= 0.01:
                             print(f"  Edge {edge['source_id'][:8]}→{edge['target_id'][:8]}: "
                                   f"{edge['weight']:.3f} → {new_weight:.3f} "
-                                  f"(rating={rating_code}, sim={sim:.2f})")
+                                  f"(reflection={reflection_code}, sim={sim:.2f})")
     else:
-        print("No rated recalls to process.")
+        print("No reflected recalls to process.")
 
     # 2. Reconsolidate affected node embeddings
     resynthesized = 0
@@ -534,7 +582,7 @@ def cmd_reconsolidate(args):
             except Exception as e:
                 print(f"  Warning: staleness check failed for {node_id[:8]}: {e}")
 
-    # 3. Clear all recalls (rated and unrated) to prevent buildup
+    # 3. Clear all recalls (reflected and unreflected) to prevent buildup
     graph.clear_processed_recalls()
 
     # 4. Rebuild cache
@@ -545,7 +593,7 @@ def cmd_reconsolidate(args):
     print(f"\nReconsolidation complete.")
     print(f"  Nodes reconsolidated: {len(affected_nodes)}")
     print(f"  Texts re-synthesized: {resynthesized}")
-    print(f"  Edges adjusted by ratings: {edges_adjusted}")
+    print(f"  Edges adjusted by reflections: {edges_adjusted}")
     print(f"  Total graph: {s['total_nodes']} nodes, {s['total_edges']} edges")
 
 

@@ -444,8 +444,8 @@ def test_create_recall(store):
     assert row[0] == 2
 
 
-def test_rate_recall(store):
-    """rate_recall should set rating codes by position."""
+def test_reflect_on_recall(store):
+    """reflect_on_recall should set reflection codes by position."""
     id1 = store.add_node("vibe", "n1", _random_embedding(510))
     id2 = store.add_node("vibe", "n2", _random_embedding(511))
 
@@ -454,18 +454,18 @@ def test_rate_recall(store):
         {"id": id2, "similarity": 0.6, "source": "seed"},
     ])
 
-    store.rate_recall(recall_id, ["U", "N"])
+    store.reflect_on_recall(recall_id, ["U", "N"])
 
     rows = store.conn.execute(
-        "SELECT position, rating FROM recall_results WHERE recall_id = ? ORDER BY position",
+        "SELECT position, reflection FROM recall_results WHERE recall_id = ? ORDER BY position",
         (recall_id,),
     ).fetchall()
     assert rows[0] == (0, "U")
     assert rows[1] == (1, "N")
 
 
-def test_get_rated_recalls(store):
-    """get_rated_recalls returns only recalls with ratings."""
+def test_get_reflected_recalls(store):
+    """get_reflected_recalls returns only recalls with reflections."""
     id1 = store.add_node("vibe", "n1", _random_embedding(520))
     id2 = store.add_node("vibe", "n2", _random_embedding(521))
 
@@ -478,23 +478,23 @@ def test_get_rated_recalls(store):
         {"id": id2, "similarity": 0.8, "source": "seed"},
     ])
 
-    store.rate_recall(r1, ["U"])
+    store.reflect_on_recall(r1, ["U"])
 
-    rated = store.get_rated_recalls()
-    assert len(rated) == 1
-    assert rated[0]["recall_id"] == r1
-    assert rated[0]["results"][0]["rating"] == "U"
-    assert rated[0]["results"][0]["node_id"] == id1
-    np.testing.assert_array_almost_equal(rated[0]["query_embedding"], emb1, decimal=5)
-
-
-def test_get_rated_recalls_empty(store):
-    """get_rated_recalls returns empty list when nothing is rated."""
-    assert store.get_rated_recalls() == []
+    reflected = store.get_reflected_recalls()
+    assert len(reflected) == 1
+    assert reflected[0]["recall_id"] == r1
+    assert reflected[0]["results"][0]["reflection"] == "U"
+    assert reflected[0]["results"][0]["node_id"] == id1
+    np.testing.assert_array_almost_equal(reflected[0]["query_embedding"], emb1, decimal=5)
 
 
-def test_clear_rated_recalls(store):
-    """clear_rated_recalls deletes rated recalls but leaves unrated ones."""
+def test_get_reflected_recalls_empty(store):
+    """get_reflected_recalls returns empty list when nothing is reflected."""
+    assert store.get_reflected_recalls() == []
+
+
+def test_clear_reflected_recalls(store):
+    """clear_reflected_recalls marks reflected recalls as dreamed but leaves unreflected ones."""
     id1 = store.add_node("vibe", "n1", _random_embedding(530))
     id2 = store.add_node("vibe", "n2", _random_embedding(531))
 
@@ -505,24 +505,26 @@ def test_clear_rated_recalls(store):
         {"id": id2, "similarity": 0.8, "source": "seed"},
     ])
 
-    store.rate_recall(r1, ["M"])
-    store.clear_rated_recalls()
+    store.reflect_on_recall(r1, ["M"])
+    store.clear_reflected_recalls()
 
-    # r1 should be gone
+    # r1 should be marked as dreamed
     row = store.conn.execute(
-        "SELECT COUNT(*) FROM recalls WHERE id = ?", (r1,)
+        "SELECT dreamed_at FROM recalls WHERE id = ?", (r1,)
     ).fetchone()
-    assert row[0] == 0
+    assert row is not None
+    assert row[0] is not None
 
-    # r2 should remain
+    # r2 should remain un-dreamed
     row = store.conn.execute(
-        "SELECT COUNT(*) FROM recalls WHERE id = ?", (r2,)
+        "SELECT dreamed_at FROM recalls WHERE id = ?", (r2,)
     ).fetchone()
-    assert row[0] == 1
+    assert row is not None
+    assert row[0] is None
 
 
 def test_clear_processed_recalls(store):
-    """clear_processed_recalls deletes ALL recalls — rated and unrated."""
+    """clear_processed_recalls marks all recalls as dreamed, not deleted."""
     id1 = store.add_node("vibe", "n1", _random_embedding(540))
     id2 = store.add_node("vibe", "n2", _random_embedding(541))
 
@@ -534,20 +536,21 @@ def test_clear_processed_recalls(store):
     ])
 
     # Rate only r1
-    store.rate_recall(r1, ["M"])
+    store.reflect_on_recall(r1, ["M"])
 
     store.clear_processed_recalls()
 
-    # Both should be gone
+    # Both should still exist but have dreamed_at set
     for rid in (r1, r2):
         row = store.conn.execute(
-            "SELECT COUNT(*) FROM recalls WHERE id = ?", (rid,)
+            "SELECT dreamed_at FROM recalls WHERE id = ?", (rid,)
         ).fetchone()
-        assert row[0] == 0
+        assert row is not None
+        assert row[0] is not None  # dreamed_at is set
 
-    # recall_results should be empty too
+    # recall_results should still be intact
     row = store.conn.execute("SELECT COUNT(*) FROM recall_results").fetchone()
-    assert row[0] == 0
+    assert row[0] == 2
 
 
 def test_schema_has_recall_tables(store):
@@ -640,8 +643,8 @@ def test_list_recalls_joins_node_data(store):
     assert r["source"] == "seed"
 
 
-def test_list_recalls_includes_ratings(store):
-    """list_recalls should show ratings after rate_recall is called."""
+def test_list_recalls_includes_reflections(store):
+    """list_recalls should show reflections after reflect_on_recall is called."""
     id1 = store.add_node("detail", "detail node", _random_embedding(640))
     id2 = store.add_node("vibe", "vibe node", _random_embedding(641))
 
@@ -653,12 +656,12 @@ def test_list_recalls_includes_ratings(store):
         ],
         session_id="session-Y",
     )
-    store.rate_recall(recall_id, ["U", "N"])
+    store.reflect_on_recall(recall_id, ["U", "N"])
 
     recalls = store.list_recalls(session_id="session-Y")
     assert len(recalls) == 1
-    assert recalls[0]["results"][0]["rating"] == "U"
-    assert recalls[0]["results"][1]["rating"] == "N"
+    assert recalls[0]["results"][0]["reflection"] == "U"
+    assert recalls[0]["results"][1]["reflection"] == "N"
 
 
 def test_list_recalls_limit(store):
@@ -699,6 +702,287 @@ def test_list_recalls_empty(store):
     """list_recalls returns empty list when no recalls exist."""
     assert store.list_recalls(session_id="nonexistent") == []
 
+
+# ---------------------------------------------------------------------------
+# list_nodes
+# ---------------------------------------------------------------------------
+
+def test_list_nodes_basic(store):
+    """list_nodes returns nodes with expected fields, no embedding blob."""
+    store.add_node("vibe", "a vibe", _random_embedding(700))
+    store.add_node("detail", "a detail", _random_embedding(701))
+
+    result = store.list_nodes()
+    assert result["total"] == 2
+    assert len(result["nodes"]) == 2
+    for node in result["nodes"]:
+        assert "id" in node
+        assert "type" in node
+        assert "text" in node
+        assert "created_at" in node
+        assert "updated_at" in node
+        assert "source_ids" in node
+        assert "embedding" not in node
+
+
+def test_list_nodes_type_filter(store):
+    """type='vibe' only returns vibes."""
+    store.add_node("vibe", "v1", _random_embedding(710))
+    store.add_node("vibe", "v2", _random_embedding(711))
+    store.add_node("detail", "d1", _random_embedding(712))
+
+    result = store.list_nodes(node_type="vibe")
+    assert result["total"] == 2
+    assert all(n["type"] == "vibe" for n in result["nodes"])
+
+
+def test_list_nodes_pagination(store):
+    """limit/offset work, total count is correct."""
+    for i in range(5):
+        store.add_node("detail", f"node {i}", _random_embedding(720 + i))
+
+    page1 = store.list_nodes(limit=2, offset=0)
+    assert page1["total"] == 5
+    assert len(page1["nodes"]) == 2
+
+    page2 = store.list_nodes(limit=2, offset=2)
+    assert page2["total"] == 5
+    assert len(page2["nodes"]) == 2
+
+    # IDs should not overlap
+    ids1 = {n["id"] for n in page1["nodes"]}
+    ids2 = {n["id"] for n in page2["nodes"]}
+    assert ids1.isdisjoint(ids2)
+
+
+def test_list_nodes_empty(store):
+    """Returns {nodes: [], total: 0} on empty store."""
+    result = store.list_nodes()
+    assert result == {"nodes": [], "total": 0}
+
+
+# ---------------------------------------------------------------------------
+# get_full_graph
+# ---------------------------------------------------------------------------
+
+def test_get_full_graph(store):
+    """Returns both nodes and edges, no embedding blobs."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(730))
+    id2 = store.add_node("detail", "n2", _random_embedding(731))
+    store.add_edge(id1, id2, weight=0.6)
+
+    result = store.get_full_graph()
+    assert len(result["nodes"]) == 2
+    assert len(result["edges"]) == 1
+    for node in result["nodes"]:
+        assert "embedding" not in node
+    assert result["edges"][0]["weight"] == pytest.approx(0.6)
+
+
+def test_get_full_graph_respects_limits(store):
+    """node_limit/edge_limit are honored."""
+    ids = []
+    for i in range(5):
+        ids.append(store.add_node("vibe", f"n{i}", _random_embedding(740 + i)))
+    for i in range(4):
+        store.add_edge(ids[i], ids[i + 1])
+
+    result = store.get_full_graph(node_limit=2, edge_limit=1)
+    assert len(result["nodes"]) == 2
+    assert len(result["edges"]) == 1
+
+
+def test_get_full_graph_empty(store):
+    """Empty store returns {nodes: [], edges: []}."""
+    result = store.get_full_graph()
+    assert result == {"nodes": [], "edges": []}
+
+
+# ---------------------------------------------------------------------------
+# reflection_distribution
+# ---------------------------------------------------------------------------
+
+def test_reflection_distribution(store):
+    """Returns correct counts per reflection code."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(750))
+    id2 = store.add_node("vibe", "n2", _random_embedding(751))
+
+    r1 = store.create_recall(_random_embedding(752), [
+        {"id": id1, "similarity": 0.9, "source": "seed"},
+        {"id": id2, "similarity": 0.8, "source": "seed"},
+    ])
+    store.reflect_on_recall(r1, ["U", "N"])
+
+    r2 = store.create_recall(_random_embedding(753), [
+        {"id": id1, "similarity": 0.7, "source": "seed"},
+    ])
+    store.reflect_on_recall(r2, ["U"])
+
+    dist = store.reflection_distribution()
+    assert dist["U"] == 2
+    assert dist["N"] == 1
+
+
+def test_reflection_distribution_empty(store):
+    """Returns empty dict when nothing reflected."""
+    assert store.reflection_distribution() == {}
+
+
+def test_reflection_timeline(store):
+    """Returns hourly-bucketed reflection counts."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(760))
+    id2 = store.add_node("detail", "n2", _random_embedding(761))
+
+    r1 = store.create_recall(_random_embedding(762), [
+        {"id": id1, "similarity": 0.9, "source": "seed"},
+        {"id": id2, "similarity": 0.8, "source": "seed"},
+    ])
+    store.reflect_on_recall(r1, ["U", "I"])
+
+    r2 = store.create_recall(_random_embedding(763), [
+        {"id": id1, "similarity": 0.7, "source": "seed"},
+    ])
+    store.reflect_on_recall(r2, ["N"])
+
+    timeline = store.reflection_timeline()
+    assert len(timeline) >= 1
+    # All created in the same second, so one bucket
+    bucket = timeline[0]
+    assert "bucket" in bucket
+    assert bucket["U"] == 1
+    assert bucket["I"] == 1
+    assert bucket["N"] == 1
+    assert bucket["D"] == 0
+    assert bucket["M"] == 0
+
+
+def test_reflection_timeline_empty(store):
+    """Returns empty list when no reflections exist."""
+    assert store.reflection_timeline() == []
+
+
+# ---------------------------------------------------------------------------
+# Reflections survive dreaming
+# ---------------------------------------------------------------------------
+
+def test_reflections_survive_clear_processed_recalls(store):
+    """Reflection timeline/distribution should still work after clear_processed_recalls."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(770))
+    id2 = store.add_node("detail", "n2", _random_embedding(771))
+
+    r1 = store.create_recall(_random_embedding(772), [
+        {"id": id1, "similarity": 0.9, "source": "seed"},
+        {"id": id2, "similarity": 0.8, "source": "seed"},
+    ])
+    store.reflect_on_recall(r1, ["U", "I"])
+
+    # Mark all recalls as dreamed (as dream reconsolidation does)
+    store.clear_processed_recalls()
+
+    # Recall data still exists
+    count = store.conn.execute("SELECT COUNT(*) FROM recall_results").fetchone()[0]
+    assert count == 2
+
+    # Reflection data persists for charts
+    dist = store.reflection_distribution()
+    assert dist["U"] == 1
+    assert dist["I"] == 1
+
+    timeline = store.reflection_timeline()
+    assert len(timeline) >= 1
+    assert timeline[0]["U"] == 1
+    assert timeline[0]["I"] == 1
+
+    # But get_reflected_recalls returns nothing (already dreamed)
+    assert store.get_reflected_recalls() == []
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# get_recalled_nodes_for_sessions
+# ---------------------------------------------------------------------------
+
+def test_get_recalled_nodes_basic(store):
+    """Returns nodes that were recalled during specified sessions."""
+    id1 = store.add_node("vibe", "functional programming", _random_embedding(800))
+    id2 = store.add_node("detail", "uses nomic embeddings", _random_embedding(801))
+
+    store.create_recall(
+        _random_embedding(802),
+        [{"id": id1, "similarity": 0.9, "source": "seed"}],
+        session_id="sess-A",
+    )
+    store.create_recall(
+        _random_embedding(803),
+        [{"id": id2, "similarity": 0.8, "source": "seed"}],
+        session_id="sess-B",
+    )
+
+    results = store.get_recalled_nodes_for_sessions(["sess-A"])
+    assert len(results) == 1
+    assert results[0]["id"] == id1
+    assert results[0]["type"] == "vibe"
+    assert results[0]["text"] == "functional programming"
+
+
+def test_get_recalled_nodes_multiple_sessions(store):
+    """Collects nodes across multiple sessions."""
+    id1 = store.add_node("vibe", "v1", _random_embedding(810))
+    id2 = store.add_node("detail", "d1", _random_embedding(811))
+
+    store.create_recall(
+        _random_embedding(812),
+        [{"id": id1, "similarity": 0.9, "source": "seed"}],
+        session_id="sess-1",
+    )
+    store.create_recall(
+        _random_embedding(813),
+        [{"id": id2, "similarity": 0.8, "source": "seed"}],
+        session_id="sess-2",
+    )
+
+    results = store.get_recalled_nodes_for_sessions(["sess-1", "sess-2"])
+    result_ids = {r["id"] for r in results}
+    assert result_ids == {id1, id2}
+
+
+def test_get_recalled_nodes_deduplicates(store):
+    """Same node recalled in multiple sessions appears only once."""
+    id1 = store.add_node("vibe", "shared vibe", _random_embedding(820))
+
+    store.create_recall(
+        _random_embedding(821),
+        [{"id": id1, "similarity": 0.9, "source": "seed"}],
+        session_id="sess-X",
+    )
+    store.create_recall(
+        _random_embedding(822),
+        [{"id": id1, "similarity": 0.85, "source": "seed"}],
+        session_id="sess-Y",
+    )
+
+    results = store.get_recalled_nodes_for_sessions(["sess-X", "sess-Y"])
+    assert len(results) == 1
+    assert results[0]["id"] == id1
+
+
+def test_get_recalled_nodes_empty_sessions(store):
+    """Returns empty list for empty session_ids input."""
+    assert store.get_recalled_nodes_for_sessions([]) == []
+
+
+def test_get_recalled_nodes_no_recalls(store):
+    """Returns empty list when sessions have no recalls."""
+    results = store.get_recalled_nodes_for_sessions(["nonexistent-session"])
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
 
 def test_migrate_adds_session_id(tmp_path):
     """Migration should add session_id column to an existing DB without it."""
@@ -745,11 +1029,18 @@ def test_migrate_adds_session_id(tmp_path):
     conn.commit()
     conn.close()
 
-    # Open with GraphStore — migration should add session_id
+    # Open with GraphStore — migration should add session_id and rename rating→reflection
     gs = GraphStore(db_path=db_path)
-    cols = {
+    recall_cols = {
         row[1] for row in
         gs.conn.execute("PRAGMA table_info(recalls)").fetchall()
     }
-    assert "session_id" in cols
+    assert "session_id" in recall_cols
+
+    rr_cols = {
+        row[1] for row in
+        gs.conn.execute("PRAGMA table_info(recall_results)").fetchall()
+    }
+    assert "reflection" in rr_cols
+    assert "rating" not in rr_cols
     gs.close()

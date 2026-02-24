@@ -247,9 +247,9 @@ async def memory_stats() -> str:
 
 @mcp.tool()
 async def list_recalls(session_id: str, limit: int = 1) -> str:
-    """List recent memory recalls for a session, with full details and ratings.
+    """List recent memory recalls for a session, with full details and reflections.
 
-    Shows what memories were injected by the prompt hook and how they were rated.
+    Shows what memories were injected by the prompt hook and how they were reflected on.
     Use with the /memories skill to let the user see their memory activity.
 
     Args:
@@ -275,7 +275,7 @@ async def list_recalls(session_id: str, limit: int = 1) -> str:
     if not recalls:
         return "No recalls found for this session."
 
-    rating_labels = {
+    reflection_labels = {
         "U": "USED", "I": "INTERESTING", "N": "NOISE",
         "D": "DISTRACTING", "M": "MISLEADING",
     }
@@ -291,11 +291,11 @@ async def list_recalls(session_id: str, limit: int = 1) -> str:
             ntype = r.get("type", "?")
             sim = r.get("similarity", 0)
             text = (r.get("text") or "")[:150]
-            rating = r.get("rating")
+            reflection = r.get("reflection")
             source = r.get("source", "seed")
 
-            rating_str = f" [{rating} = {rating_labels.get(rating, '?')}]" if rating else " [unrated]"
-            lines.append(f"  {i}. [{ntype}] (sim: {sim:.2f}, via: {source}){rating_str}")
+            reflection_str = f" [{reflection} = {reflection_labels.get(reflection, '?')}]" if reflection else " [unreflected]"
+            lines.append(f"  {i}. [{ntype}] (sim: {sim:.2f}, via: {source}){reflection_str}")
             lines.append(f"     {text}")
 
         parts.append("\n".join(lines))
@@ -303,7 +303,7 @@ async def list_recalls(session_id: str, limit: int = 1) -> str:
     return "\n\n".join(parts)
 
 
-RATING_LABELS = {
+REFLECTION_LABELS = {
     "U": ("USED", 2),
     "I": ("INTERESTING", 1),
     "N": ("NOISE", 0),
@@ -313,22 +313,22 @@ RATING_LABELS = {
 
 
 @mcp.tool()
-async def rate_memories(ratings: str):
-    """Rate memories from the most recent graph memory injection.
+async def reflect(reflections: str):
+    """Reflect on memories from the most recent graph memory injection.
 
     Call this once per turn when graph memories are injected via the prompt hook.
-    The prompt hook output includes a recall ID — pass it back with ratings.
+    The prompt hook output includes a recall ID — pass it back with reflections.
 
     Format: recall_id:U,I,N,N,M
     One letter per memory, in order. Codes: U=used, I=interesting, N=noise, D=distracting, M=misleading.
 
     Args:
-        ratings: Compact rating string like "abc123:U,I,N,N,M"
+        reflections: Compact reflection string like "abc123:U,I,N,N,M"
     """
-    if ":" not in ratings:
+    if ":" not in reflections:
         return "Error: expected format recall_id:U,I,N,N,M"
 
-    recall_id, codes_str = ratings.split(":", 1)
+    recall_id, codes_str = reflections.split(":", 1)
     recall_id = recall_id.strip()
     codes_str = codes_str.strip()
 
@@ -337,7 +337,7 @@ async def rate_memories(ratings: str):
 
     # Validate codes locally before sending
     codes = [c.strip() for c in codes_str.split(",")]
-    valid_codes = set(RATING_LABELS.keys())
+    valid_codes = set(REFLECTION_LABELS.keys())
     for c in codes:
         if c not in valid_codes:
             return f"Error: invalid code {c!r}. Valid: U, I, N, D, M"
@@ -346,8 +346,8 @@ async def rate_memories(ratings: str):
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                f"{SERVER_URL}/rate_recall",
-                json={"recall_id": recall_id, "ratings": codes_str},
+                f"{SERVER_URL}/reflect_on_recall",
+                json={"recall_id": recall_id, "reflections": codes_str},
             )
             resp.raise_for_status()
     except httpx.ConnectError:

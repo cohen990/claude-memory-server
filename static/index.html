@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Memory Browser</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+</head>
+<body>
+  <nav>
+    <span class="logo">memory</span>
+    <button class="tab active" data-tab="graph">Graph</button>
+    <button class="tab" data-tab="recalls">Recalls</button>
+    <button class="tab" data-tab="stats">Stats</button>
+  </nav>
+
+  <main>
+    <!-- Graph tab -->
+    <section id="tab-graph" class="tab-content active">
+      <div id="graph-toolbar">
+        <label><input type="checkbox" id="filter-vibe" checked> Vibes</label>
+        <label><input type="checkbox" id="filter-detail" checked> Details</label>
+        <button id="btn-fit">Fit</button>
+        <button id="btn-relayout">Relayout</button>
+        <input type="text" id="graph-search" placeholder="Search nodes...">
+        <span id="graph-status"></span>
+      </div>
+      <div id="cy"></div>
+      <aside id="sidebar" class="hidden">
+        <button id="sidebar-close">&times;</button>
+        <h3 id="sidebar-type"></h3>
+        <p id="sidebar-text"></p>
+        <div id="sidebar-meta"></div>
+        <h4>Neighbors</h4>
+        <ul id="sidebar-neighbors"></ul>
+      </aside>
+    </section>
+
+    <!-- Recalls tab -->
+    <section id="tab-recalls" class="tab-content">
+      <div id="recalls-toolbar">
+        <input type="text" id="recalls-session" placeholder="Filter by session ID...">
+        <button id="recalls-load">Load</button>
+      </div>
+      <div id="recalls-list"></div>
+      <button id="recalls-more" class="hidden">Load more</button>
+    </section>
+
+    <!-- Stats tab -->
+    <section id="tab-stats" class="tab-content">
+      <div id="stats-grid"></div>
+      <div id="reflection-chart-container">
+        <h4 id="reflection-chart-title">Reflection Timeline</h4>
+        <canvas id="reflection-chart"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

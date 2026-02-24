@@ -3,7 +3,7 @@
 Standalone module, no FastAPI dependency. Owns the sqlite DB and all
 graph operations. Nodes hold synthesized memories (vibes/details) with
 embeddings; edges encode weighted associations between them. Search
-walks the graph neighborhood; recalls and agent ratings drive edge
+walks the graph neighborhood; recalls and agent reflections drive edge
 weight changes during dream reconsolidation.
 """
 
@@ -38,10 +38,12 @@ def blob_to_embedding(blob: bytes) -> np.ndarray:
 class GraphStore:
     """Graph-based long-term memory store backed by sqlite."""
 
-    def __init__(self, db_path: str | None = None):
+    def __init__(self, db_path: str | None = None,
+                 check_same_thread: bool = True):
         self.db_path = db_path or GRAPH_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path,
+                                    check_same_thread=check_same_thread)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self._create_schema()
@@ -87,11 +89,12 @@ class GraphStore:
                 similarity REAL NOT NULL,
                 source TEXT NOT NULL,
                 connected_via TEXT,
-                rating TEXT,
+                reflection TEXT,
                 PRIMARY KEY (recall_id, position),
                 FOREIGN KEY (recall_id) REFERENCES recalls(id),
                 FOREIGN KEY (node_id) REFERENCES nodes(id)
             );
+
         """)
         # Partial index for activated edges — sqlite requires separate statement
         try:
@@ -106,13 +109,27 @@ class GraphStore:
 
     def _migrate(self):
         """Run schema migrations for columns added after initial release."""
-        # Add session_id to recalls table (added for /memories skill)
         cols = {
             row[1] for row in
             self.conn.execute("PRAGMA table_info(recalls)").fetchall()
         }
         if "session_id" not in cols:
             self.conn.execute("ALTER TABLE recalls ADD COLUMN session_id TEXT")
+        if "query_text" not in cols:
+            self.conn.execute("ALTER TABLE recalls ADD COLUMN query_text TEXT")
+        if "dreamed_at" not in cols:
+            self.conn.execute("ALTER TABLE recalls ADD COLUMN dreamed_at TEXT")
+        self.conn.execute("DROP TABLE IF EXISTS rating_events")
+
+        # Rename rating → reflection in recall_results
+        rr_cols = {
+            row[1] for row in
+            self.conn.execute("PRAGMA table_info(recall_results)").fetchall()
+        }
+        if "rating" in rr_cols and "reflection" not in rr_cols:
+            self.conn.execute(
+                "ALTER TABLE recall_results RENAME COLUMN rating TO reflection"
+            )
 
     def _rebuild_cache(self):
         """Load all node embeddings into a pre-normalized numpy matrix."""
@@ -298,7 +315,9 @@ class GraphStore:
     # ------------------------------------------------------------------
 
     def add_edge(self, source_id: str, target_id: str, weight: float = 0.5):
-        """Insert an edge, ignoring if it already exists."""
+        """Insert an edge, ignoring if it already exists or is a self-edge."""
+        if source_id == target_id:
+            return
         now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             "INSERT OR IGNORE INTO edges (source_id, target_id, weight, created_at, activation_count) "
@@ -378,7 +397,7 @@ class GraphStore:
                expand_neighbors: bool = True) -> list[dict]:
         """Search the graph by vector similarity with optional neighbor expansion.
 
-        Pure read — no side effects. Recalls and ratings drive edge weight
+        Pure read — no side effects. Recalls and reflections drive edge weight
         changes during dream reconsolidation.
 
         1. Brute-force cosine across all nodes
@@ -463,15 +482,16 @@ class GraphStore:
 
     def create_recall(self, query_embedding: np.ndarray,
                       results: list[dict],
-                      session_id: str | None = None) -> str:
+                      session_id: str | None = None,
+                      query_text: str | None = None) -> str:
         """Store a recall (search event) and its ordered results. Returns recall ID."""
         recall_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
         self.conn.execute(
-            "INSERT INTO recalls (id, query_embedding, created_at, session_id) "
-            "VALUES (?, ?, ?, ?)",
-            (recall_id, embedding_to_blob(query_embedding), now, session_id),
+            "INSERT INTO recalls (id, query_embedding, created_at, session_id, query_text) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (recall_id, embedding_to_blob(query_embedding), now, session_id, query_text),
         )
         for i, r in enumerate(results):
             self.conn.execute(
@@ -484,34 +504,36 @@ class GraphStore:
         self.conn.commit()
         return recall_id
 
-    def rate_recall(self, recall_id: str, ratings: list[str]):
-        """Set rating codes on recall_results by position.
+    def reflect_on_recall(self, recall_id: str, reflections: list[str]):
+        """Set reflection codes on recall_results by position.
 
-        ratings: list of single-char codes like ['U', 'I', 'N', 'N', 'M'].
+        reflections: list of single-char codes like ['U', 'I', 'N', 'N', 'M'].
         """
-        for i, code in enumerate(ratings):
+        for i, code in enumerate(reflections):
             self.conn.execute(
-                "UPDATE recall_results SET rating = ? "
+                "UPDATE recall_results SET reflection = ? "
                 "WHERE recall_id = ? AND position = ?",
                 (code, recall_id, i),
             )
         self.conn.commit()
 
-    def get_rated_recalls(self) -> list[dict]:
-        """Return recalls that have at least one rated result, for dream consumption.
+    def get_reflected_recalls(self) -> list[dict]:
+        """Return un-dreamed recalls that have at least one reflected result.
 
         Returns list of dicts with keys: recall_id, query_embedding, results.
-        Each result has: node_id, similarity, source, connected_via, rating.
+        Each result has: node_id, similarity, source, connected_via, reflection.
         """
-        # Find recall IDs that have at least one non-null rating
-        rated_ids = self.conn.execute(
-            "SELECT DISTINCT recall_id FROM recall_results WHERE rating IS NOT NULL"
+        # Find recall IDs that have reflections and haven't been dreamed yet
+        reflected_ids = self.conn.execute(
+            "SELECT DISTINCT rr.recall_id FROM recall_results rr "
+            "JOIN recalls r ON r.id = rr.recall_id "
+            "WHERE rr.reflection IS NOT NULL AND r.dreamed_at IS NULL"
         ).fetchall()
-        if not rated_ids:
+        if not reflected_ids:
             return []
 
         recalls = []
-        for (recall_id,) in rated_ids:
+        for (recall_id,) in reflected_ids:
             row = self.conn.execute(
                 "SELECT query_embedding FROM recalls WHERE id = ?",
                 (recall_id,),
@@ -520,7 +542,7 @@ class GraphStore:
                 continue
 
             results = self.conn.execute(
-                "SELECT node_id, similarity, source, connected_via, rating "
+                "SELECT node_id, similarity, source, connected_via, reflection "
                 "FROM recall_results WHERE recall_id = ? ORDER BY position",
                 (recall_id,),
             ).fetchall()
@@ -534,7 +556,7 @@ class GraphStore:
                         "similarity": r[1],
                         "source": r[2],
                         "connected_via": r[3],
-                        "rating": r[4],
+                        "reflection": r[4],
                     }
                     for r in results
                 ],
@@ -548,26 +570,26 @@ class GraphStore:
 
         Joins recalls → recall_results → nodes, ordered by created_at DESC.
         Returns list of dicts with keys: recall_id, created_at, session_id,
-        results (each with node_id, type, text, similarity, source, rating).
+        results (each with node_id, type, text, similarity, source, reflection).
         """
         if session_id:
             rows = self.conn.execute(
-                "SELECT id, created_at, session_id FROM recalls "
+                "SELECT id, created_at, session_id, query_text FROM recalls "
                 "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT id, created_at, session_id FROM recalls "
+                "SELECT id, created_at, session_id, query_text FROM recalls "
                 "ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
 
         recalls = []
-        for recall_id, created_at, sess_id in rows:
+        for recall_id, created_at, sess_id, query_text in rows:
             results = self.conn.execute(
                 "SELECT rr.node_id, rr.similarity, rr.source, "
-                "rr.connected_via, rr.rating, n.type, n.text "
+                "rr.connected_via, rr.reflection, n.type, n.text "
                 "FROM recall_results rr "
                 "LEFT JOIN nodes n ON rr.node_id = n.id "
                 "WHERE rr.recall_id = ? ORDER BY rr.position",
@@ -578,13 +600,14 @@ class GraphStore:
                 "recall_id": recall_id,
                 "created_at": created_at,
                 "session_id": sess_id,
+                "query_text": query_text,
                 "results": [
                     {
                         "node_id": r[0],
                         "similarity": r[1],
                         "source": r[2],
                         "connected_via": r[3],
-                        "rating": r[4],
+                        "reflection": r[4],
                         "type": r[5],
                         "text": r[6],
                     }
@@ -594,29 +617,168 @@ class GraphStore:
 
         return recalls
 
-    def clear_rated_recalls(self):
-        """Delete recalls that have been rated (processed by dream)."""
-        rated_ids = self.conn.execute(
-            "SELECT DISTINCT recall_id FROM recall_results WHERE rating IS NOT NULL"
+    def clear_reflected_recalls(self):
+        """Mark reflected recalls as dreamed."""
+        now = datetime.now(timezone.utc).isoformat()
+        reflected_ids = self.conn.execute(
+            "SELECT DISTINCT recall_id FROM recall_results WHERE reflection IS NOT NULL"
         ).fetchall()
-        if not rated_ids:
+        if not reflected_ids:
             return
 
-        ids = [r[0] for r in rated_ids]
+        ids = [r[0] for r in reflected_ids]
         placeholders = ",".join("?" * len(ids))
         self.conn.execute(
-            f"DELETE FROM recall_results WHERE recall_id IN ({placeholders})", ids
-        )
-        self.conn.execute(
-            f"DELETE FROM recalls WHERE id IN ({placeholders})", ids
+            f"UPDATE recalls SET dreamed_at = ? WHERE id IN ({placeholders})",
+            [now] + ids,
         )
         self.conn.commit()
 
+    def get_recalled_nodes_for_sessions(self, session_ids: list[str]) -> list[dict]:
+        """Fetch unique nodes that were recalled during the given sessions.
+
+        Joins recalls → recall_results → nodes filtered by session_id IN (...).
+        Returns list of {id, type, text} — no embeddings. Deduplicated by node_id.
+        """
+        if not session_ids:
+            return []
+
+        placeholders = ",".join("?" * len(session_ids))
+        rows = self.conn.execute(
+            f"SELECT DISTINCT n.id, n.type, n.text "
+            f"FROM recalls r "
+            f"JOIN recall_results rr ON r.id = rr.recall_id "
+            f"JOIN nodes n ON rr.node_id = n.id "
+            f"WHERE r.session_id IN ({placeholders})",
+            session_ids,
+        ).fetchall()
+
+        return [{"id": r[0], "type": r[1], "text": r[2]} for r in rows]
+
     def clear_processed_recalls(self):
-        """Delete ALL recalls (rated and unrated) to prevent buildup."""
-        self.conn.execute("DELETE FROM recall_results")
-        self.conn.execute("DELETE FROM recalls")
+        """Mark all recalls as dreamed instead of deleting them."""
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "UPDATE recalls SET dreamed_at = ? WHERE dreamed_at IS NULL",
+            (now,),
+        )
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Read-only queries (for browse UI)
+    # ------------------------------------------------------------------
+
+    def list_nodes(self, node_type: str | None = None,
+                   limit: int = 50, offset: int = 0) -> dict:
+        """Paginated node listing without embedding blobs."""
+        if node_type:
+            total = self.conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE type = ?", (node_type,)
+            ).fetchone()[0]
+            rows = self.conn.execute(
+                "SELECT id, type, text, created_at, updated_at, source_ids "
+                "FROM nodes WHERE type = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (node_type, limit, offset),
+            ).fetchall()
+        else:
+            total = self.conn.execute(
+                "SELECT COUNT(*) FROM nodes"
+            ).fetchone()[0]
+            rows = self.conn.execute(
+                "SELECT id, type, text, created_at, updated_at, source_ids "
+                "FROM nodes ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+
+        return {
+            "nodes": [
+                {
+                    "id": r[0],
+                    "type": r[1],
+                    "text": r[2],
+                    "created_at": r[3],
+                    "updated_at": r[4],
+                    "source_ids": json.loads(r[5]),
+                }
+                for r in rows
+            ],
+            "total": total,
+        }
+
+    def get_full_graph(self, node_limit: int = 2000,
+                       edge_limit: int = 5000) -> dict:
+        """All nodes + edges for Cytoscape.js initial load (no embeddings)."""
+        node_rows = self.conn.execute(
+            "SELECT id, type, text, created_at, updated_at, source_ids "
+            "FROM nodes LIMIT ?",
+            (node_limit,),
+        ).fetchall()
+        edge_rows = self.conn.execute(
+            "SELECT source_id, target_id, weight, created_at, last_activated, activation_count "
+            "FROM edges LIMIT ?",
+            (edge_limit,),
+        ).fetchall()
+
+        return {
+            "nodes": [
+                {
+                    "id": r[0],
+                    "type": r[1],
+                    "text": r[2],
+                    "created_at": r[3],
+                    "updated_at": r[4],
+                    "source_ids": json.loads(r[5]),
+                }
+                for r in node_rows
+            ],
+            "edges": [
+                {
+                    "source_id": r[0],
+                    "target_id": r[1],
+                    "weight": r[2],
+                    "created_at": r[3],
+                    "last_activated": r[4],
+                    "activation_count": r[5],
+                }
+                for r in edge_rows
+            ],
+        }
+
+    def reflection_distribution(self) -> dict:
+        """Count of each reflection code across all recall results."""
+        rows = self.conn.execute(
+            "SELECT reflection, COUNT(*) FROM recall_results "
+            "WHERE reflection IS NOT NULL GROUP BY reflection"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def reflection_timeline(self) -> list[dict]:
+        """Reflection counts bucketed by hour.
+
+        Returns list of {bucket, U, I, N, D, M} sorted chronologically.
+        Bucket is ISO timestamp truncated to the hour.
+        """
+        rows = self.conn.execute(
+            "SELECT substr(r.created_at, 1, 13) AS bucket, "
+            "       rr.reflection, COUNT(*) "
+            "FROM recall_results rr "
+            "JOIN recalls r ON r.id = rr.recall_id "
+            "WHERE rr.reflection IS NOT NULL "
+            "GROUP BY bucket, rr.reflection "
+            "ORDER BY bucket"
+        ).fetchall()
+
+        buckets: dict[str, dict] = {}
+        for bucket_str, reflection, count in rows:
+            if bucket_str not in buckets:
+                buckets[bucket_str] = {
+                    "bucket": bucket_str + ":00:00",
+                    "U": 0, "I": 0, "N": 0, "D": 0, "M": 0,
+                }
+            if reflection in buckets[bucket_str]:
+                buckets[bucket_str][reflection] = count
+
+        return list(buckets.values())
 
     # ------------------------------------------------------------------
     # Stats
@@ -640,6 +802,15 @@ class GraphStore:
             "total_edges": total_edges,
             "activated_edges": activated_edges,
         }
+
+    def pending_dream_count(self) -> int:
+        """Count of reflected recalls that haven't been dreamed yet."""
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT rr.recall_id) FROM recall_results rr "
+            "JOIN recalls r ON r.id = rr.recall_id "
+            "WHERE rr.reflection IS NOT NULL AND r.dreamed_at IS NULL"
+        ).fetchone()
+        return row[0]
 
     def close(self):
         self.conn.close()
