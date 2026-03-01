@@ -776,6 +776,13 @@ async def reload_graph_cache():
     return {"status": "ok", "nodes": s["total_nodes"], "edges": s["total_edges"]}
 
 
+@app.post("/graph/recompute_layout")
+async def recompute_layout():
+    """Recompute graph layout positions and cache them."""
+    positions = graph_store.compute_layout()
+    return {"status": "ok", "nodes_positioned": len(positions)}
+
+
 # ---------------------------------------------------------------------------
 # Graph browse endpoints (read-only, used by browse.py)
 # ---------------------------------------------------------------------------

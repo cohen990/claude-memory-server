@@ -115,6 +115,24 @@ def reload_cache():
         return None
 
 
+def recompute_layout():
+    """Tell the server to recompute graph layout positions."""
+    req = urllib.request.Request(
+        f"{SERVER_URL}/graph/recompute_layout",
+        data=b"",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+            print(f"  Layout recomputed: {data.get('nodes_positioned', 0)} nodes positioned")
+            return data
+    except Exception as e:
+        print(f"Warning: Could not recompute layout: {e}")
+        return None
+
+
 SYNTHESIS_SCHEMA = json.dumps({
     "type": "object",
     "properties": {
@@ -490,9 +508,10 @@ def cmd_consolidate(args):
             edges_created=total_edges,
         )
 
-    # Rebuild cache on server
+    # Rebuild cache on server and recompute layout
     graph._rebuild_cache()
     reload_cache()
+    recompute_layout()
 
     s = graph.stats()
     print(f"\nConsolidation complete.")

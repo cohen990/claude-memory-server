@@ -65,6 +65,16 @@ async def reflection_timeline():
     return await _proxy("/graph/reflection-timeline")
 
 
+@app.get("/api/dream-runs")
+async def dream_runs(request: Request):
+    return await _proxy("/graph/dream-runs", dict(request.query_params))
+
+
+@app.get("/api/dream-runs/{run_id}/operations")
+async def dream_run_operations(run_id: str):
+    return await _proxy(f"/graph/dream-runs/{run_id}/operations")
+
+
 @app.get("/api/stats")
 async def stats():
     """Combine graph stats, reflections, and main server stats."""

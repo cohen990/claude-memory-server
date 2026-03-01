@@ -7,6 +7,7 @@ export interface GraphNode {
   created_at: string
   updated_at: string
   source_ids: string[]
+  position?: { x: number; y: number } | null
 }
 
 export interface GraphEdge {
@@ -87,4 +88,28 @@ export interface TimelineBucket {
   N: number
   D: number
   M: number
+}
+
+export interface DreamRun {
+  id: string
+  type: 'consolidate' | 'reconsolidate'
+  started_at: string
+  finished_at: string | null
+  chunks_processed: number
+  nodes_created: number
+  nodes_merged: number
+  edges_created: number
+  edges_adjusted: number
+  nodes_resynthesized: number
+  error: string | null
+}
+
+export interface DreamOperation {
+  id: number
+  run_id: string
+  timestamp: string
+  operation: string
+  node_id: string | null
+  node_type: string | null
+  detail: Record<string, unknown>
 }

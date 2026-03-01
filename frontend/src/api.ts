@@ -5,6 +5,8 @@ import type {
   RecallsResponse,
   StatsResponse,
   TimelineBucket,
+  DreamRun,
+  DreamOperation,
 } from './types'
 
 async function get<T>(url: string): Promise<T> {
@@ -42,4 +44,13 @@ export function fetchStats(): Promise<StatsResponse> {
 
 export function fetchReflectionTimeline(): Promise<TimelineBucket[]> {
   return get('/api/reflection-timeline')
+}
+
+export function fetchDreamRuns(limit?: number): Promise<{ runs: DreamRun[] }> {
+  const qs = limit ? `?limit=${limit}` : ''
+  return get(`/api/dream-runs${qs}`)
+}
+
+export function fetchDreamOperations(runId: string): Promise<{ operations: DreamOperation[] }> {
+  return get(`/api/dream-runs/${encodeURIComponent(runId)}/operations`)
 }

@@ -30,7 +30,7 @@ export default function GraphToolbar({
         <input type="checkbox" checked={showDetail} onChange={onToggleDetail} /> Details
       </label>
       <button onClick={onFit}>Fit</button>
-      <button onClick={onRelayout}>Relayout</button>
+      <button onClick={onRelayout}>Reset layout</button>
       <input
         className="graph-search"
         type="text"

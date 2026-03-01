@@ -8,17 +8,23 @@ weight changes during dream reconsolidation.
 """
 
 import json
+import math
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 
+import networkx as nx
 import numpy as np
 
 
 GRAPH_DB_PATH = os.environ.get(
     "GRAPH_DB_PATH",
     os.path.expanduser("~/.memory-server/graph.db"),
+)
+LAYOUT_CACHE_PATH = os.environ.get(
+    "LAYOUT_CACHE",
+    os.path.expanduser("~/.memory-server/layout_cache.json"),
 )
 
 EMBEDDING_DIM = 768  # nomic-embed-text-v1.5 Matryoshka 768-dim
@@ -74,6 +80,31 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
+
+            CREATE TABLE IF NOT EXISTS dream_runs (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                chunks_processed INTEGER NOT NULL DEFAULT 0,
+                nodes_created INTEGER NOT NULL DEFAULT 0,
+                nodes_merged INTEGER NOT NULL DEFAULT 0,
+                edges_created INTEGER NOT NULL DEFAULT 0,
+                edges_adjusted INTEGER NOT NULL DEFAULT 0,
+                nodes_resynthesized INTEGER NOT NULL DEFAULT 0,
+                error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS dream_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                node_id TEXT,
+                node_type TEXT,
+                detail TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES dream_runs(id)
+            );
 
             CREATE TABLE IF NOT EXISTS recalls (
                 id TEXT PRIMARY KEY,
@@ -705,6 +736,101 @@ class GraphStore:
             "total": total,
         }
 
+    def compute_layout(self, cache_path: str | None = None) -> dict[str, dict]:
+        """Compute x/y positions for all nodes using networkx spring layout.
+
+        Detects connected components, lays out each independently, then tiles
+        them in a grid (largest-first, left-to-right with wrapping).
+        Caches result to JSON. Returns {node_id: {"x": float, "y": float}}.
+        """
+        cache_path = cache_path or LAYOUT_CACHE_PATH
+
+        node_rows = self.conn.execute("SELECT id FROM nodes").fetchall()
+        edge_rows = self.conn.execute(
+            "SELECT source_id, target_id, weight FROM edges"
+        ).fetchall()
+
+        if not node_rows:
+            positions: dict[str, dict] = {}
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(positions, f)
+            return positions
+
+        G = nx.Graph()
+        for (node_id,) in node_rows:
+            G.add_node(node_id)
+        for src, tgt, weight in edge_rows:
+            if G.has_node(src) and G.has_node(tgt):
+                # Compress weight range to reduce spacing variance.
+                # Raw weights span [0,1] → layout_weight in [0.7, 1.0].
+                # Weak edges still attract substantially, keeping the graph
+                # compact while preserving relative topology.
+                layout_weight = 0.7 + weight * 0.3
+                G.add_edge(src, tgt, weight=layout_weight)
+
+        # Layout each connected component independently
+        components = sorted(nx.connected_components(G), key=len, reverse=True)
+        component_positions: list[dict[str, tuple[float, float]]] = []
+        component_sizes: list[int] = []
+
+        for comp_nodes in components:
+            subgraph = G.subgraph(comp_nodes)
+            n = len(comp_nodes)
+            pos = nx.spring_layout(
+                subgraph, weight="weight", iterations=100,
+                seed=42, scale=math.sqrt(n),
+            )
+            component_positions.append({n: (float(x), float(y)) for n, (x, y) in pos.items()})
+            component_sizes.append(len(comp_nodes))
+
+        # Tile components in a grid: left-to-right with wrapping
+        cols = max(1, int(math.ceil(math.sqrt(len(components)))))
+        spacing = 3.0  # gap between component bounding boxes (in layout units)
+        positions = {}
+        offset_x = 0.0
+        offset_y = 0.0
+        row_height = 0.0
+        col_idx = 0
+
+        for comp_pos in component_positions:
+            if not comp_pos:
+                continue
+
+            xs = [p[0] for p in comp_pos.values()]
+            ys = [p[1] for p in comp_pos.values()]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            width = max_x - min_x
+            height = max_y - min_y
+
+            for node_id, (x, y) in comp_pos.items():
+                positions[node_id] = {
+                    "x": round(x - min_x + offset_x, 2),
+                    "y": round(y - min_y + offset_y, 2),
+                }
+
+            row_height = max(row_height, height)
+            offset_x += width + spacing
+            col_idx += 1
+
+            if col_idx >= cols:
+                col_idx = 0
+                offset_x = 0.0
+                offset_y += row_height + spacing
+                row_height = 0.0
+
+        # Scale to pixel-space
+        for pos in positions.values():
+            pos["x"] = round(pos["x"] * 75, 1)
+            pos["y"] = round(pos["y"] * 75, 1)
+
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(positions, f)
+
+        return positions
+
     def get_full_graph(self, node_limit: int = 2000,
                        edge_limit: int = 5000) -> dict:
         """All nodes + edges for Cytoscape.js initial load (no embeddings)."""
@@ -719,6 +845,14 @@ class GraphStore:
             (edge_limit,),
         ).fetchall()
 
+        # Load cached layout positions
+        layout_positions: dict[str, dict] = {}
+        try:
+            with open(LAYOUT_CACHE_PATH) as f:
+                layout_positions = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
         return {
             "nodes": [
                 {
@@ -728,6 +862,7 @@ class GraphStore:
                     "created_at": r[3],
                     "updated_at": r[4],
                     "source_ids": json.loads(r[5]),
+                    "position": layout_positions.get(r[0]),
                 }
                 for r in node_rows
             ],
@@ -814,3 +949,96 @@ class GraphStore:
 
     def close(self):
         self.conn.close()
+
+
+class DreamLog:
+    """Append-only dream log backed by the same sqlite DB as GraphStore."""
+
+    def __init__(self, graph_store: GraphStore):
+        self.conn = graph_store.conn
+
+    def start_run(self, run_type: str) -> str:
+        """Insert a dream_runs row and return the run UUID."""
+        run_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "INSERT INTO dream_runs (id, type, started_at) VALUES (?, ?, ?)",
+            (run_id, run_type, now),
+        )
+        self.conn.commit()
+        return run_id
+
+    def log_operation(self, run_id: str, operation: str,
+                      node_id: str | None, node_type: str | None,
+                      detail: dict):
+        """Insert a dream_operations row."""
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "INSERT INTO dream_operations "
+            "(run_id, timestamp, operation, node_id, node_type, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, now, operation, node_id, node_type, json.dumps(detail)),
+        )
+        self.conn.commit()
+
+    def finish_run(self, run_id: str, *, error: str | None = None,
+                   chunks_processed: int = 0, nodes_created: int = 0,
+                   nodes_merged: int = 0, edges_created: int = 0,
+                   edges_adjusted: int = 0, nodes_resynthesized: int = 0):
+        """Update a dream_runs row with final counts and finished_at."""
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            "UPDATE dream_runs SET finished_at = ?, error = ?, "
+            "chunks_processed = ?, nodes_created = ?, nodes_merged = ?, "
+            "edges_created = ?, edges_adjusted = ?, nodes_resynthesized = ? "
+            "WHERE id = ?",
+            (now, error, chunks_processed, nodes_created, nodes_merged,
+             edges_created, edges_adjusted, nodes_resynthesized, run_id),
+        )
+        self.conn.commit()
+
+    def list_runs(self, limit: int = 20) -> list[dict]:
+        """Return recent dream runs, newest first."""
+        rows = self.conn.execute(
+            "SELECT id, type, started_at, finished_at, chunks_processed, "
+            "nodes_created, nodes_merged, edges_created, edges_adjusted, "
+            "nodes_resynthesized, error "
+            "FROM dream_runs ORDER BY started_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "type": r[1],
+                "started_at": r[2],
+                "finished_at": r[3],
+                "chunks_processed": r[4],
+                "nodes_created": r[5],
+                "nodes_merged": r[6],
+                "edges_created": r[7],
+                "edges_adjusted": r[8],
+                "nodes_resynthesized": r[9],
+                "error": r[10],
+            }
+            for r in rows
+        ]
+
+    def get_run_operations(self, run_id: str) -> list[dict]:
+        """Return all operations for a given run."""
+        rows = self.conn.execute(
+            "SELECT id, run_id, timestamp, operation, node_id, node_type, detail "
+            "FROM dream_operations WHERE run_id = ? ORDER BY id",
+            (run_id,),
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "run_id": r[1],
+                "timestamp": r[2],
+                "operation": r[3],
+                "node_id": r[4],
+                "node_type": r[5],
+                "detail": json.loads(r[6]),
+            }
+            for r in rows
+        ]

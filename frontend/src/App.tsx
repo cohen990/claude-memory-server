@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Nav, { type Tab } from './components/Nav'
 import GraphTab from './components/graph/GraphTab'
 import RecallsTab from './components/recalls/RecallsTab'
+import DreamsTab from './components/dreams/DreamsTab'
 import StatsTab from './components/stats/StatsTab'
 
 export default function App() {
@@ -16,6 +17,7 @@ export default function App() {
           <GraphTab />
         </div>
         {tab === 'recalls' && <RecallsTab />}
+        {tab === 'dreams' && <DreamsTab />}
         {tab === 'stats' && <StatsTab />}
       </main>
     </>

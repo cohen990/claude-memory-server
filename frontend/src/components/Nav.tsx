@@ -1,4 +1,4 @@
-export type Tab = 'graph' | 'recalls' | 'stats'
+export type Tab = 'graph' | 'recalls' | 'dreams' | 'stats'
 
 interface NavProps {
   active: Tab
@@ -8,6 +8,7 @@ interface NavProps {
 const tabs: { id: Tab; label: string }[] = [
   { id: 'graph', label: 'Graph' },
   { id: 'recalls', label: 'Recalls' },
+  { id: 'dreams', label: 'Dreams' },
   { id: 'stats', label: 'Stats' },
 ]
 

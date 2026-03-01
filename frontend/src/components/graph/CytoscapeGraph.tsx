@@ -28,12 +28,21 @@ const CytoscapeGraph = forwardRef<CytoscapeGraphHandle, Props>(
         cyRef.current?.fit()
       },
       relayout() {
-        if (!cyRef.current) return
-        cyRef.current.layout({
-          name: 'cose',
-          animate: true,
-          animationDuration: 500,
-        } as cytoscape.LayoutOptions).run()
+        const cy = cyRef.current
+        if (!cy || !data) return
+        const posMap = new Map(
+          data.nodes
+            .filter(n => n.position != null)
+            .map(n => [n.id, n.position!])
+        )
+        if (posMap.size === 0) return
+        cy.batch(() => {
+          cy.nodes().forEach(node => {
+            const pos = posMap.get(node.id())
+            if (pos) node.position(pos)
+          })
+        })
+        cy.fit()
       },
       applyFilters(showVibe: boolean, showDetail: boolean) {
         const cy = cyRef.current
@@ -94,16 +103,22 @@ const CytoscapeGraph = forwardRef<CytoscapeGraphHandle, Props>(
       }
       degreeRef.current = degree
 
+      const hasPositions = data.nodes.every(n => n.position != null)
+
       const elements: cytoscape.ElementDefinition[] = []
       for (const node of data.nodes) {
-        elements.push({
+        const el: cytoscape.ElementDefinition = {
           data: {
             id: node.id,
             label: node.text.slice(0, 60),
             type: node.type,
             fullText: node.text,
           },
-        })
+        }
+        if (hasPositions && node.position) {
+          el.position = { x: node.position.x, y: node.position.y }
+        }
+        elements.push(el)
       }
       for (const edge of data.edges) {
         elements.push({
@@ -135,7 +150,13 @@ const CytoscapeGraph = forwardRef<CytoscapeGraphHandle, Props>(
               'background-color'(ele: cytoscape.NodeSingular) {
                 return ele.data('type') === 'vibe' ? '#6366f1' : '#14b8a6'
               },
-              'border-width': 0,
+              'border-width': 1,
+              'border-color'(ele: cytoscape.NodeSingular) {
+                // Cross-color: vibes get teal outline, details get indigo
+                return ele.data('type') === 'vibe'
+                  ? 'rgba(20, 184, 166, 0.25)'
+                  : 'rgba(99, 102, 241, 0.25)'
+              },
             } as unknown as cytoscape.Css.Node,
           },
           {
@@ -171,7 +192,7 @@ const CytoscapeGraph = forwardRef<CytoscapeGraphHandle, Props>(
           },
         ],
         layout: { name: 'preset' },
-        autoungrabify: true,
+        autoungrabify: false,
         minZoom: 0.1,
         maxZoom: 5,
       })
@@ -196,21 +217,25 @@ const CytoscapeGraph = forwardRef<CytoscapeGraphHandle, Props>(
 
       cyRef.current = cy
 
-      onStatusChange(`${data.nodes.length} nodes, ${data.edges.length} edges — laying out...`)
-
-      requestAnimationFrame(() => {
-        cy.layout({
-          name: 'cose',
-          animate: true,
-          animationDuration: 500,
-          fit: true,
-          nodeOverlap: 20,
-          componentSpacing: 40,
-        } as cytoscape.LayoutOptions).run()
-        cy.one('layoutstop', () => {
-          onStatusChange(`${data.nodes.length} nodes, ${data.edges.length} edges`)
+      if (hasPositions) {
+        onStatusChange(`${data.nodes.length} nodes, ${data.edges.length} edges (pre-rendered)`)
+        requestAnimationFrame(() => cy.fit())
+      } else {
+        onStatusChange(`${data.nodes.length} nodes, ${data.edges.length} edges — laying out...`)
+        requestAnimationFrame(() => {
+          cy.layout({
+            name: 'cose',
+            animate: true,
+            animationDuration: 500,
+            fit: true,
+            nodeOverlap: 20,
+            componentSpacing: 40,
+          } as cytoscape.LayoutOptions).run()
+          cy.one('layoutstop', () => {
+            onStatusChange(`${data.nodes.length} nodes, ${data.edges.length} edges`)
+          })
         })
-      })
+      }
 
       return () => {
         cy.destroy()

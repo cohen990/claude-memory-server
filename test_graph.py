@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from graph import GraphStore, embedding_to_blob, blob_to_embedding, EMBEDDING_DIM
+from graph import GraphStore, DreamLog, embedding_to_blob, blob_to_embedding, EMBEDDING_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +799,118 @@ def test_get_full_graph_empty(store):
 
 
 # ---------------------------------------------------------------------------
+# compute_layout
+# ---------------------------------------------------------------------------
+
+def test_compute_layout_basic(store, tmp_path):
+    """compute_layout returns positions for all nodes."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(780))
+    id2 = store.add_node("detail", "n2", _random_embedding(781))
+    store.add_edge(id1, id2, weight=0.6)
+
+    cache_path = str(tmp_path / "layout.json")
+    positions = store.compute_layout(cache_path=cache_path)
+
+    assert id1 in positions
+    assert id2 in positions
+    assert "x" in positions[id1]
+    assert "y" in positions[id1]
+
+    # Cache file should exist
+    import json
+    with open(cache_path) as f:
+        cached = json.load(f)
+    assert cached == positions
+
+
+def test_compute_layout_disconnected_components(store, tmp_path):
+    """Disconnected components get tiled without overlapping."""
+    # Component 1
+    a1 = store.add_node("vibe", "a1", _random_embedding(790))
+    a2 = store.add_node("vibe", "a2", _random_embedding(791))
+    store.add_edge(a1, a2)
+
+    # Component 2 (disconnected)
+    b1 = store.add_node("detail", "b1", _random_embedding(792))
+    b2 = store.add_node("detail", "b2", _random_embedding(793))
+    store.add_edge(b1, b2)
+
+    cache_path = str(tmp_path / "layout.json")
+    positions = store.compute_layout(cache_path=cache_path)
+
+    assert len(positions) == 4
+    # All four nodes should have positions
+    for nid in [a1, a2, b1, b2]:
+        assert nid in positions
+
+
+def test_compute_layout_empty(store, tmp_path):
+    """Empty graph produces empty positions."""
+    cache_path = str(tmp_path / "layout.json")
+    positions = store.compute_layout(cache_path=cache_path)
+    assert positions == {}
+
+
+def test_compute_layout_isolated_nodes(store, tmp_path):
+    """Nodes with no edges still get positions."""
+    id1 = store.add_node("vibe", "isolated1", _random_embedding(795))
+    id2 = store.add_node("detail", "isolated2", _random_embedding(796))
+
+    cache_path = str(tmp_path / "layout.json")
+    positions = store.compute_layout(cache_path=cache_path)
+
+    assert id1 in positions
+    assert id2 in positions
+
+
+def test_compute_layout_deterministic(store, tmp_path):
+    """Layout with seed=42 should be deterministic across runs."""
+    id1 = store.add_node("vibe", "n1", _random_embedding(797))
+    id2 = store.add_node("detail", "n2", _random_embedding(798))
+    store.add_edge(id1, id2)
+
+    cache1 = str(tmp_path / "layout1.json")
+    cache2 = str(tmp_path / "layout2.json")
+    pos1 = store.compute_layout(cache_path=cache1)
+    pos2 = store.compute_layout(cache_path=cache2)
+
+    assert pos1 == pos2
+
+
+# ---------------------------------------------------------------------------
+# get_full_graph with positions
+# ---------------------------------------------------------------------------
+
+def test_get_full_graph_includes_positions(store, tmp_path):
+    """get_full_graph includes cached positions when available."""
+    from graph import LAYOUT_CACHE_PATH
+    id1 = store.add_node("vibe", "n1", _random_embedding(850))
+    id2 = store.add_node("detail", "n2", _random_embedding(851))
+    store.add_edge(id1, id2)
+
+    # Compute layout to the default cache path
+    store.compute_layout()
+
+    result = store.get_full_graph()
+    for node in result["nodes"]:
+        assert "position" in node
+        assert node["position"] is not None
+        assert "x" in node["position"]
+        assert "y" in node["position"]
+
+
+def test_get_full_graph_null_positions_without_cache(store, tmp_path):
+    """get_full_graph returns null positions when no cache exists."""
+    # Use a store that won't have a cache file
+    id1 = store.add_node("vibe", "n1", _random_embedding(860))
+
+    result = store.get_full_graph()
+    for node in result["nodes"]:
+        assert "position" in node
+        assert node["position"] is None
+
+
+# ---------------------------------------------------------------------------
 # reflection_distribution
 # ---------------------------------------------------------------------------
 
@@ -1044,3 +1156,122 @@ def test_migrate_adds_session_id(tmp_path):
     assert "reflection" in rr_cols
     assert "rating" not in rr_cols
     gs.close()
+
+
+# ---------------------------------------------------------------------------
+# DreamLog
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def dream_log(store):
+    """Create a DreamLog backed by the test store."""
+    return DreamLog(store)
+
+
+def test_dream_schema_created(store):
+    """dream_runs and dream_operations tables should exist."""
+    tables = store.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+    table_names = {t[0] for t in tables}
+    assert "dream_runs" in table_names
+    assert "dream_operations" in table_names
+
+
+def test_start_run(dream_log):
+    """start_run inserts a row and returns a UUID."""
+    run_id = dream_log.start_run("consolidate")
+    assert run_id
+    assert len(run_id) == 36  # UUID format
+
+    row = dream_log.conn.execute(
+        "SELECT type, started_at, finished_at FROM dream_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    assert row[0] == "consolidate"
+    assert row[1] is not None
+    assert row[2] is None  # not finished yet
+
+
+def test_log_operation(dream_log):
+    """log_operation inserts operations correctly."""
+    run_id = dream_log.start_run("consolidate")
+    dream_log.log_operation(run_id, "node_created", "node-abc", "vibe",
+                            {"text": "some text", "source_count": 3})
+    dream_log.log_operation(run_id, "edge_created", None, None,
+                            {"source_id": "a", "target_id": "b", "weight": 0.5})
+
+    ops = dream_log.get_run_operations(run_id)
+    assert len(ops) == 2
+    assert ops[0]["operation"] == "node_created"
+    assert ops[0]["node_id"] == "node-abc"
+    assert ops[0]["node_type"] == "vibe"
+    assert ops[0]["detail"]["text"] == "some text"
+    assert ops[1]["operation"] == "edge_created"
+    assert ops[1]["node_id"] is None
+
+
+def test_finish_run(dream_log):
+    """finish_run updates counts and finished_at."""
+    run_id = dream_log.start_run("reconsolidate")
+    dream_log.finish_run(run_id, edges_adjusted=5, nodes_resynthesized=2)
+
+    runs = dream_log.list_runs()
+    assert len(runs) == 1
+    r = runs[0]
+    assert r["id"] == run_id
+    assert r["type"] == "reconsolidate"
+    assert r["finished_at"] is not None
+    assert r["edges_adjusted"] == 5
+    assert r["nodes_resynthesized"] == 2
+    assert r["error"] is None
+
+
+def test_finish_run_with_error(dream_log):
+    """finish_run records error string."""
+    run_id = dream_log.start_run("consolidate")
+    dream_log.finish_run(run_id, error="something broke", chunks_processed=10)
+
+    runs = dream_log.list_runs()
+    assert runs[0]["error"] == "something broke"
+    assert runs[0]["chunks_processed"] == 10
+
+
+def test_list_runs_ordering(dream_log):
+    """list_runs returns newest first."""
+    r1 = dream_log.start_run("consolidate")
+    dream_log.finish_run(r1)
+    r2 = dream_log.start_run("reconsolidate")
+    dream_log.finish_run(r2)
+
+    runs = dream_log.list_runs()
+    assert len(runs) == 2
+    # r2 was started after r1, so it comes first
+    assert runs[0]["id"] == r2
+    assert runs[1]["id"] == r1
+
+
+def test_list_runs_limit(dream_log):
+    """list_runs respects the limit parameter."""
+    for _ in range(5):
+        rid = dream_log.start_run("consolidate")
+        dream_log.finish_run(rid)
+
+    runs = dream_log.list_runs(limit=2)
+    assert len(runs) == 2
+
+
+def test_list_runs_empty(dream_log):
+    """list_runs returns empty list when no runs exist."""
+    assert dream_log.list_runs() == []
+
+
+def test_get_run_operations_empty(dream_log):
+    """get_run_operations returns empty list for run with no ops."""
+    run_id = dream_log.start_run("consolidate")
+    assert dream_log.get_run_operations(run_id) == []
+
+
+def test_get_run_operations_nonexistent(dream_log):
+    """get_run_operations returns empty list for nonexistent run."""
+    assert dream_log.get_run_operations("nonexistent-id") == []

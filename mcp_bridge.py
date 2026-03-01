@@ -313,7 +313,7 @@ REFLECTION_LABELS = {
 
 
 @mcp.tool()
-async def reflect(reflections: str):
+async def reflect(r: str):
     """Reflect on memories from the most recent graph memory injection.
 
     Call this once per turn when graph memories are injected via the prompt hook.
@@ -323,12 +323,12 @@ async def reflect(reflections: str):
     One letter per memory, in order. Codes: U=used, I=interesting, N=noise, D=distracting, M=misleading.
 
     Args:
-        reflections: Compact reflection string like "abc123:U,I,N,N,M"
+        r: Compact reflection string like "abc123:U,I,N,N,M"
     """
-    if ":" not in reflections:
+    if ":" not in r:
         return "Error: expected format recall_id:U,I,N,N,M"
 
-    recall_id, codes_str = reflections.split(":", 1)
+    recall_id, codes_str = r.split(":", 1)
     recall_id = recall_id.strip()
     codes_str = codes_str.strip()
 

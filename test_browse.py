@@ -45,6 +45,23 @@ FAKE_RECALL = {
     ],
 }
 
+FAKE_DREAM_RUN = {
+    "id": "dr1", "type": "consolidate",
+    "started_at": "2025-01-01T00:00:00", "finished_at": "2025-01-01T00:01:00",
+    "chunks_processed": 20, "nodes_created": 3, "nodes_merged": 5,
+    "edges_created": 12, "edges_adjusted": 0, "nodes_resynthesized": 0,
+    "error": None,
+}
+
+FAKE_DREAM_OPS = [
+    {"id": 1, "run_id": "dr1", "timestamp": "2025-01-01T00:00:01",
+     "operation": "node_created", "node_id": "n1", "node_type": "vibe",
+     "detail": {"text": "test vibe", "source_count": 2}},
+    {"id": 2, "run_id": "dr1", "timestamp": "2025-01-01T00:00:02",
+     "operation": "edge_created", "node_id": None, "node_type": None,
+     "detail": {"source_id": "n1", "target_id": "n2", "weight": 0.7}},
+]
+
 FAKE_MAIN_STATS = {
     "total_documents": 100, "total_subchunks": 500, "total_user_inputs": 80,
     "collection_name": "conversations", "subchunk_collection_name": "subchunks",
@@ -128,6 +145,14 @@ def mock_transport():
         {"bucket": "2025-01-01T00:00:00", "U": 2, "I": 1, "N": 0, "D": 0, "M": 0},
         {"bucket": "2025-01-01T01:00:00", "U": 0, "I": 0, "N": 3, "D": 1, "M": 0},
     ])
+
+    # /graph/dream-runs
+    transport.add("GET", "/graph/dream-runs",
+                  {"runs": [FAKE_DREAM_RUN]})
+
+    # /graph/dream-runs/dr1/operations
+    transport.add("GET", "/graph/dream-runs/dr1/operations",
+                  {"operations": FAKE_DREAM_OPS})
 
     # /stats
     transport.add("GET", "/stats", FAKE_MAIN_STATS)
@@ -259,3 +284,26 @@ def test_reflection_timeline(client):
     assert len(data) == 2
     assert data[0]["U"] == 2
     assert data[1]["N"] == 3
+
+
+# ---------------------------------------------------------------------------
+# /api/dream-runs
+# ---------------------------------------------------------------------------
+
+def test_dream_runs(client):
+    resp = client.get("/api/dream-runs")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["runs"]) == 1
+    assert data["runs"][0]["id"] == "dr1"
+    assert data["runs"][0]["type"] == "consolidate"
+    assert data["runs"][0]["nodes_created"] == 3
+
+
+def test_dream_run_operations(client):
+    resp = client.get("/api/dream-runs/dr1/operations")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["operations"]) == 2
+    assert data["operations"][0]["operation"] == "node_created"
+    assert data["operations"][1]["operation"] == "edge_created"
