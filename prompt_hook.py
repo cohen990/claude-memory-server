@@ -17,12 +17,16 @@ import urllib.error
 SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
 
 
-def search_graph(query: str, k: int = 5, session_id: str = "") -> dict:
+def search_graph(query: str, k: int = 5, session_id: str = "",
+                  min_similarity: float = 0.5) -> dict:
     """Search the graph memory layer for synthesized long-term memories.
 
     Returns {"results": [...], "recall_id": str|None}.
+    Results below min_similarity are filtered server-side and excluded from
+    the stored recall, so recall_results count matches what we display.
     """
-    body = {"q": query, "k": k, "expand_neighbors": True}
+    body = {"q": query, "k": k, "expand_neighbors": True,
+            "min_similarity": min_similarity}
     if session_id:
         body["session_id"] = session_id
     payload = json.dumps(body).encode("utf-8")
@@ -89,8 +93,7 @@ def main():
     graph_data = search_graph(query, k=5, session_id=current_session)
     graph_results = graph_data.get("results", [])
     recall_id = graph_data.get("recall_id")
-    graph_relevant = [r for r in graph_results if r.get("similarity", 0) > 0.5]
-    if not graph_relevant:
+    if not graph_results:
         return
 
     lines = ["--- AGENT MEMORY (not visible to user) ---"]
@@ -98,8 +101,8 @@ def main():
         lines.append(f"(current session: {current_session} — pass as exclude_session_id to avoid self-references)")
 
     recall_tag = f" recall:{recall_id}" if recall_id else ""
-    lines.append(f"[graph]{recall_tag} | {len(graph_relevant)} synthesized memor{'ies' if len(graph_relevant) != 1 else 'y'}:")
-    for r in graph_relevant:
+    lines.append(f"[graph]{recall_tag} | {len(graph_results)} synthesized memor{'ies' if len(graph_results) != 1 else 'y'}:")
+    for r in graph_results:
         node_id = r.get("id", "?")
         ntype = r.get("type", "?")
         sim = r.get("similarity", 0)
@@ -116,7 +119,8 @@ def main():
     lines.append("Detail memories are associative recall, not authoritative records — validate specifics against source conversations before relying on them.")
     lines.append("Use search_memory or search_memory_detail tools with session_id to retrieve full source conversations.")
     if recall_id:
-        lines.append(f"Reflect on these memories using the reflect tool: {recall_id}:U,I,N,N,M (one code per memory above, in order)")
+        example_codes = ",".join(["U"] + ["N"] * (len(graph_results) - 1)) if graph_results else "U"
+        lines.append(f"Reflect on these memories using the reflect tool: {recall_id}:{example_codes} (one code per memory above, in order)")
     lines.append("--- END AGENT MEMORY ---")
     print("\n".join(lines))
 

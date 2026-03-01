@@ -361,6 +361,7 @@ class GraphSearchRequest(BaseModel):
     expand_neighbors: bool = True
     node_type: Optional[str] = None
     session_id: Optional[str] = None
+    min_similarity: Optional[float] = None
 
 
 class ListRecallsRequest(BaseModel):
@@ -658,11 +659,14 @@ async def search_graph(req: GraphSearchRequest):
         query_embedding, k=req.k, expand_neighbors=req.expand_neighbors,
     )
 
-    # Optional type post-filter
+    # Optional post-filters
+    if req.min_similarity is not None:
+        results = [r for r in results if r.get("similarity", 0) >= req.min_similarity]
     if req.node_type:
         results = [r for r in results if r.get("type") == req.node_type]
 
-    # Store recall for reflection feedback
+    # Store recall for reflection feedback — only stores results that survived
+    # filtering, so recall_results count matches what the caller actually sees.
     recall_id = None
     if results:
         recall_id = graph_store.create_recall(
