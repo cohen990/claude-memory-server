@@ -39,23 +39,24 @@ export default function RecallsTab() {
     }
   }, [sessionFilter])
 
-  // Poll for new recalls — prepend new ones
+  // Poll — prepend new recalls and update existing ones (e.g. reflections)
   const poll = useCallback(async () => {
     try {
       const params: { limit: number; session_id?: string } = { limit: PAGE_SIZE }
       if (sessionFilter) params.session_id = sessionFilter
 
       const data = await fetchRecalls(params)
-      const newRecalls = data.recalls.filter(r => !recallIdsRef.current.has(r.recall_id))
+      const freshById = new Map(data.recalls.map(r => [r.recall_id, r]))
 
-      if (newRecalls.length > 0) {
-        setRecalls(prev => {
-          const ids = new Set(prev.map(r => r.recall_id))
-          const toAdd = newRecalls.filter(r => !ids.has(r.recall_id))
-          for (const r of toAdd) recallIdsRef.current.add(r.recall_id)
-          return [...toAdd, ...prev]
-        })
-      }
+      setRecalls(prev => {
+        // Update existing recalls with fresh data
+        const updated = prev.map(r => freshById.get(r.recall_id) ?? r)
+        // Prepend genuinely new ones
+        const existingIds = new Set(prev.map(r => r.recall_id))
+        const toAdd = data.recalls.filter(r => !existingIds.has(r.recall_id))
+        for (const r of toAdd) recallIdsRef.current.add(r.recall_id)
+        return toAdd.length > 0 ? [...toAdd, ...updated] : updated
+      })
     } catch {
       // Silent poll failure
     }
