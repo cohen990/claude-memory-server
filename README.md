@@ -434,6 +434,9 @@ curl -X POST http://your-server:8420/search_graph \
 | `REFLECTION_SCALE` | `0.02` | dream.py — multiplier for reflection-driven edge weight changes |
 | `BROWSE_HOST` | `0.0.0.0` | browse.py |
 | `BROWSE_PORT` | `8421` | browse.py |
+| `SURPRISAL_GATE` | `0` | prompt_hook.py — `0` = log-only, `1` = enforce gate |
+| `SURPRISAL_GENERAL_THRESHOLD` | `6.0` | surprisal.py — minimum general surprisal to consider substantive |
+| `SURPRISAL_PERSONAL_THRESHOLD` | `12.0` | surprisal.py — maximum personal surprisal to consider familiar |
 
 ## Troubleshooting
 
@@ -484,5 +487,17 @@ This destroys all chunk data and re-ingests from JSONL transcripts. It takes a l
 **Prompt hook**: Fires on UserPromptSubmit. Searches user_inputs and graph memory, injects compact hints so Claude knows what's relevant without fetching full context. Each graph search creates a recall with a unique ID. These hints are private to the agent — the user doesn't see them.
 
 **Reflections**: The agent reflects on each recalled memory (U/I/N/D/M) using the `reflect` MCP tool. Reflections are stored on the recall and drive edge weight adjustments during the next dream cycle. Unreflected recalls have no effect — only explicit reflections change the graph. Users can inspect injected memories and their reflections via the `/memories` skill (or the `list_recalls` MCP tool directly).
+
+**Surprisal gate**: The prompt hook uses word-level surprisal to decide whether a query is worth running through memory retrieval. It computes mean surprisal against two unigram frequency tables: a **general English** corpus (289k words from [wordfreq](https://github.com/rspeer/wordfreq), which merges Reddit, Twitter, Wikipedia, and web crawl data) and a **personal corpus** built from the user's own conversation history. Retrieval fires when general surprisal is high (substantive, technical content — not filler like "hi how are you") AND personal surprisal is low (familiar topic — memories likely exist). This skips ~58% of queries that would otherwise return only noise.
+
+The personal corpus builds automatically — every ingested conversation updates word frequency counts. **The gate needs a few weeks of conversation history to calibrate well.** With a fresh install, leave `SURPRISAL_GATE=0` (log-only mode, the default) until you have enough personal corpus data. You can monitor gate decisions in the browse UI — each recall shows its general and personal surprisal scores and the gen/pers ratio. Once you're satisfied the gate is making good decisions, set `SURPRISAL_GATE=1` to enforce it.
+
+To bootstrap the personal corpus from existing data, run `backfill_word_counts.py` after initial setup:
+
+```bash
+MEMORY_SERVER_URL=http://your-server:8420 python backfill_word_counts.py
+```
+
+The general English frequency table also needs a one-time load. The backfill script handles both — it requires the `wordfreq` package (`pip install wordfreq`).
 
 **Dream pipeline**: Nightly consolidation reads recent conversations, synthesizes them into graph nodes (vibes and details) via Claude CLI, and connects them with weighted edges. Reconsolidation processes reflected recalls — adjusting edge weights by `reflection_value * cosine_similarity * REFLECTION_SCALE` — then blends node embeddings with their neighbors and re-synthesizes stale text descriptions.
