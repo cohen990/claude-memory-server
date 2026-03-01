@@ -435,6 +435,46 @@ curl -X POST http://your-server:8420/search_graph \
 | `BROWSE_HOST` | `0.0.0.0` | browse.py |
 | `BROWSE_PORT` | `8421` | browse.py |
 
+## Troubleshooting
+
+### Server segfaults on startup (ChromaDB HNSW index corruption)
+
+If the server crashes with a segfault (exit code 139, stack trace in `chromadb_rust_bindings`), the HNSW index files are corrupted but the data in SQLite is intact. This can happen if multiple processes open the same ChromaDB directory concurrently.
+
+**Fix**: Delete the binary index directories and let ChromaDB rebuild them from the WAL on next startup.
+
+```bash
+# Stop the server
+systemctl --user stop memory-server
+
+# Identify collection UUID directories
+sqlite3 ~/.memory-server/chromadb/chroma.sqlite3 \
+  "select s.id, c.name from segments s join collections c on s.collection=c.id where s.scope='VECTOR';"
+
+# Remove the index directory for affected collection(s)
+rm -rf ~/.memory-server/chromadb/<uuid-from-above>
+
+# Restart — ChromaDB rebuilds the index automatically
+systemctl --user start memory-server
+```
+
+Rebuild time depends on collection size. No data is lost.
+
+Ref: [ChromaDB Cookbook — Rebuilding](https://cookbook.chromadb.dev/strategies/rebuilding/)
+
+### Clean re-ingest (last resort)
+
+Only if the SQLite data itself is corrupted or collections need schema changes:
+
+```bash
+rm -rf ~/.memory-server/chromadb
+rm -f ~/.memory-server/ingested_sessions.json
+systemctl --user restart memory-server
+MEMORY_SERVER_URL=http://your-server:8420 python batch_import.py --reset
+```
+
+This destroys all chunk data and re-ingests from JSONL transcripts. It takes a long time and should only be used when targeted repair isn't possible.
+
 ## How It Works
 
 **Ingestion**: The Stop hook fires after each Claude response. It reads the hook context from stdin (transcript path), extracts the latest user/assistant turn pair, and POSTs it to the server. The server embeds the text with nomic-embed-text-v1.5 (using the `search_document:` task prefix) and stores it in three collections: the full turn pair, 500-char subchunks, and the user message alone.
