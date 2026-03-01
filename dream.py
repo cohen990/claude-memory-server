@@ -22,7 +22,7 @@ from datetime import datetime, timezone, timedelta
 
 import numpy as np
 
-from graph import GraphStore
+from graph import GraphStore, DreamLog
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,8 +44,6 @@ REFLECTION_VALUES = {
     "M": -2,
 }
 
-CHROMA_DIR = os.environ.get("CHROMA_DIR", os.path.expanduser("~/.memory-server/chromadb"))
-COLLECTION_NAME = "conversations"
 
 
 # ---------------------------------------------------------------------------
@@ -266,196 +264,230 @@ Write a single updated description that integrates insights from the related mem
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_consolidate(args):
-    """Read recent conversations from ChromaDB and synthesize into graph nodes."""
-    import chromadb
+def _fetch_undreamed_chunks(days: int | None = None) -> tuple[list[str], list[str], list[dict]]:
+    """Fetch un-dreamed chunks from the server API.
 
+    Returns (docs, ids, metas) lists.
+    """
+    params = {}
+    if days is not None:
+        params["days"] = str(days)
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"{SERVER_URL}/chunks/undreamed"
+    if qs:
+        url += f"?{qs}"
+
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+
+    docs = [c["text"] for c in data["chunks"]]
+    ids = [c["id"] for c in data["chunks"]]
+    metas = [c["metadata"] for c in data["chunks"]]
+    return docs, ids, metas
+
+
+def _mark_chunks_dreamed(batch_ids: list[str], batch_metas: list[dict]):
+    """Mark chunks as dreamed via the server API."""
+    marked_metas = [{**m, "dreamed": 1} for m in batch_metas]
+    body = json.dumps({"ids": batch_ids, "metadatas": marked_metas}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{SERVER_URL}/chunks/mark_dreamed",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def cmd_consolidate(args):
+    """Read recent conversations and synthesize into graph nodes."""
     if args.days:
         print(f"Consolidating last {args.days} days of conversations...")
     else:
         print("Consolidating all un-dreamed conversations...")
 
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    collection = client.get_or_create_collection(name=COLLECTION_NAME)
-
-    total = collection.count()
-    if total == 0:
-        print("No conversations found.")
-        return
-
-    # Filter to chunks not yet processed by dream.
-    # Chunks ingested before the dreamed field was added won't have it,
-    # so we use $ne 1 (matches both dreamed=0 and missing field).
-    results = collection.get(
-        where={"dreamed": {"$ne": 1}},
-        include=["documents", "metadatas"],
-        limit=total,
-    )
-
-    docs = []
-    ids = []
-    metas = []
-
-    if args.days:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
-        cutoff_str = cutoff.isoformat()
-        for i, meta in enumerate(results["metadatas"]):
-            ts = meta.get("timestamp", "")
-            if ts >= cutoff_str:
-                docs.append(results["documents"][i])
-                ids.append(results["ids"][i])
-                metas.append(meta)
-    else:
-        docs = results["documents"]
-        ids = results["ids"]
-        metas = results["metadatas"]
+    docs, ids, metas = _fetch_undreamed_chunks(days=args.days)
 
     if not ids:
         print("No un-dreamed conversations found.")
         return
 
-    print(f"Found {len(docs)} un-dreamed chunks (of {total} total).")
+    print(f"Found {len(docs)} un-dreamed chunks.")
 
     # Process in batches to stay within context limits
     batch_size = 20
     graph = GraphStore()
+    dream_log = DreamLog(graph)
+    run_id = dream_log.start_run("consolidate")
     total_vibes = 0
     total_details = 0
+    total_merged = 0
     total_edges = 0
+    run_error = None
 
-    for batch_start in range(0, len(docs), batch_size):
-        batch_docs = docs[batch_start:batch_start + batch_size]
-        batch_ids = ids[batch_start:batch_start + batch_size]
-        batch_metas = metas[batch_start:batch_start + batch_size]
-        print(f"\nProcessing batch {batch_start // batch_size + 1} ({len(batch_docs)} chunks)...")
+    try:
+        for batch_start in range(0, len(docs), batch_size):
+            batch_docs = docs[batch_start:batch_start + batch_size]
+            batch_ids = ids[batch_start:batch_start + batch_size]
+            batch_metas = metas[batch_start:batch_start + batch_size]
+            print(f"\nProcessing batch {batch_start // batch_size + 1} ({len(batch_docs)} chunks)...")
 
-        # Collect session IDs from this batch and fetch recalled nodes
-        batch_session_ids = list({
-            m["session_id"] for m in batch_metas
-            if m.get("session_id")
-        })
-        recalled_nodes = []
-        if batch_session_ids:
-            recalled_nodes = graph.get_recalled_nodes_for_sessions(batch_session_ids)
-            if recalled_nodes:
-                print(f"  Found {len(recalled_nodes)} recalled nodes from {len(batch_session_ids)} sessions")
-
-        try:
-            synthesis = synthesize(batch_docs, recalled_nodes=recalled_nodes or None)
-        except Exception as e:
-            print(f"  Synthesis error: {e}")
-            continue
-
-        # Process vibes
-        for vibe in synthesis.get("vibes", []):
-            text = vibe["text"]
-            source_indices = vibe.get("source_indices", [])
-            source_ids = [batch_ids[i] for i in source_indices if i < len(batch_ids)]
+            # Collect session IDs from this batch and fetch recalled nodes
+            batch_session_ids = list({
+                m["session_id"] for m in batch_metas
+                if m.get("session_id")
+            })
+            recalled_nodes = []
+            if batch_session_ids:
+                recalled_nodes = graph.get_recalled_nodes_for_sessions(batch_session_ids)
+                if recalled_nodes:
+                    print(f"  Found {len(recalled_nodes)} recalled nodes from {len(batch_session_ids)} sessions")
 
             try:
-                embedding = embed_text(text)
+                synthesis = synthesize(batch_docs, recalled_nodes=recalled_nodes or None)
             except Exception as e:
-                print(f"  Embed error for vibe: {e}")
+                print(f"  Synthesis error: {e}")
+                dream_log.log_operation(run_id, "error", None, None,
+                                        {"message": f"Synthesis error: {e}"})
                 continue
 
-            existing = graph.find_similar(embedding, threshold=SIMILARITY_THRESHOLD, node_type="vibe")
-            if existing:
-                graph.merge_node_embedding(existing["id"], embedding, new_source_ids=source_ids)
-                print(f"  Merged vibe into {existing['id'][:8]}...: {text[:60]}")
-            else:
-                node_id = graph.add_node("vibe", text, embedding, source_ids=source_ids)
-                print(f"  Created vibe {node_id[:8]}...: {text[:60]}")
-                total_vibes += 1
+            # Process vibes
+            for vibe in synthesis.get("vibes", []):
+                text = vibe["text"]
+                source_indices = vibe.get("source_indices", [])
+                source_ids = [batch_ids[i] for i in source_indices if i < len(batch_ids)]
 
-        # Process details
-        for detail in synthesis.get("details", []):
-            text = detail["text"]
-            source_indices = detail.get("source_indices", [])
-            source_ids = [batch_ids[i] for i in source_indices if i < len(batch_ids)]
+                try:
+                    embedding = embed_text(text)
+                except Exception as e:
+                    print(f"  Embed error for vibe: {e}")
+                    continue
 
-            try:
-                embedding = embed_text(text)
-            except Exception as e:
-                print(f"  Embed error for detail: {e}")
-                continue
-
-            existing = graph.find_similar(embedding, threshold=SIMILARITY_THRESHOLD, node_type="detail")
-            if existing:
-                graph.merge_node_embedding(existing["id"], embedding, new_source_ids=source_ids)
-                print(f"  Merged detail into {existing['id'][:8]}...: {text[:60]}")
-            else:
-                node_id = graph.add_node("detail", text, embedding, source_ids=source_ids)
-                print(f"  Created detail {node_id[:8]}...: {text[:60]}")
-                total_details += 1
-
-        # Process connections
-        # Build index of nodes created in this batch for connection lookup
-        all_nodes = []
-        for v in synthesis.get("vibes", []):
-            # Find the node we just created/merged
-            try:
-                emb = embed_text(v["text"])
-                found = graph.find_similar(emb, threshold=0.9)
-                if found:
-                    all_nodes.append(("vibe", found["id"]))
+                existing = graph.find_similar(embedding, threshold=SIMILARITY_THRESHOLD, node_type="vibe")
+                if existing:
+                    graph.merge_node_embedding(existing["id"], embedding, new_source_ids=source_ids)
+                    print(f"  Merged vibe into {existing['id'][:8]}...: {text[:60]}")
+                    dream_log.log_operation(run_id, "node_merged", existing["id"], "vibe",
+                                            {"text": text, "similarity": existing.get("similarity", 0),
+                                             "source_count": len(source_ids)})
+                    total_merged += 1
                 else:
+                    node_id = graph.add_node("vibe", text, embedding, source_ids=source_ids)
+                    print(f"  Created vibe {node_id[:8]}...: {text[:60]}")
+                    dream_log.log_operation(run_id, "node_created", node_id, "vibe",
+                                            {"text": text, "source_count": len(source_ids)})
+                    total_vibes += 1
+
+            # Process details
+            for detail in synthesis.get("details", []):
+                text = detail["text"]
+                source_indices = detail.get("source_indices", [])
+                source_ids = [batch_ids[i] for i in source_indices if i < len(batch_ids)]
+
+                try:
+                    embedding = embed_text(text)
+                except Exception as e:
+                    print(f"  Embed error for detail: {e}")
+                    continue
+
+                existing = graph.find_similar(embedding, threshold=SIMILARITY_THRESHOLD, node_type="detail")
+                if existing:
+                    graph.merge_node_embedding(existing["id"], embedding, new_source_ids=source_ids)
+                    print(f"  Merged detail into {existing['id'][:8]}...: {text[:60]}")
+                    dream_log.log_operation(run_id, "node_merged", existing["id"], "detail",
+                                            {"text": text, "similarity": existing.get("similarity", 0),
+                                             "source_count": len(source_ids)})
+                    total_merged += 1
+                else:
+                    node_id = graph.add_node("detail", text, embedding, source_ids=source_ids)
+                    print(f"  Created detail {node_id[:8]}...: {text[:60]}")
+                    dream_log.log_operation(run_id, "node_created", node_id, "detail",
+                                            {"text": text, "source_count": len(source_ids)})
+                    total_details += 1
+
+            # Process connections
+            # Build index of nodes created in this batch for connection lookup
+            all_nodes = []
+            for v in synthesis.get("vibes", []):
+                # Find the node we just created/merged
+                try:
+                    emb = embed_text(v["text"])
+                    found = graph.find_similar(emb, threshold=0.9)
+                    if found:
+                        all_nodes.append(("vibe", found["id"]))
+                    else:
+                        all_nodes.append(("vibe", None))
+                except Exception:
                     all_nodes.append(("vibe", None))
-            except Exception:
-                all_nodes.append(("vibe", None))
 
-        for d in synthesis.get("details", []):
-            try:
-                emb = embed_text(d["text"])
-                found = graph.find_similar(emb, threshold=0.9)
-                if found:
-                    all_nodes.append(("detail", found["id"]))
-                else:
+            for d in synthesis.get("details", []):
+                try:
+                    emb = embed_text(d["text"])
+                    found = graph.find_similar(emb, threshold=0.9)
+                    if found:
+                        all_nodes.append(("detail", found["id"]))
+                    else:
+                        all_nodes.append(("detail", None))
+                except Exception:
                     all_nodes.append(("detail", None))
-            except Exception:
-                all_nodes.append(("detail", None))
 
-        # Build lookup for existing (recalled) nodes
-        existing_node_ids = [n["id"] for n in recalled_nodes]
+            # Build lookup for existing (recalled) nodes
+            existing_node_ids = [n["id"] for n in recalled_nodes]
 
-        for conn in synthesis.get("connections", []):
-            weight = conn.get("weight", 0.5)
-            from_id = None
-            to_id = None
+            for conn in synthesis.get("connections", []):
+                weight = conn.get("weight", 0.5)
+                from_id = None
+                to_id = None
 
-            # Resolve "from" side
-            if "from_existing_idx" in conn:
-                idx = conn["from_existing_idx"]
-                if 0 <= idx < len(existing_node_ids):
-                    from_id = existing_node_ids[idx]
-            elif "from_idx" in conn and "from_type" in conn:
-                from_type = conn["from_type"]
-                from_idx = conn["from_idx"]
-                typed_nodes = [(i, n) for i, (t, n) in enumerate(all_nodes) if t == from_type]
-                if from_idx < len(typed_nodes):
-                    from_id = typed_nodes[from_idx][1]
+                # Resolve "from" side
+                if "from_existing_idx" in conn:
+                    idx = conn["from_existing_idx"]
+                    if 0 <= idx < len(existing_node_ids):
+                        from_id = existing_node_ids[idx]
+                elif "from_idx" in conn and "from_type" in conn:
+                    from_type = conn["from_type"]
+                    from_idx = conn["from_idx"]
+                    typed_nodes = [(i, n) for i, (t, n) in enumerate(all_nodes) if t == from_type]
+                    if from_idx < len(typed_nodes):
+                        from_id = typed_nodes[from_idx][1]
 
-            # Resolve "to" side
-            if "to_existing_idx" in conn:
-                idx = conn["to_existing_idx"]
-                if 0 <= idx < len(existing_node_ids):
-                    to_id = existing_node_ids[idx]
-            elif "to_idx" in conn and "to_type" in conn:
-                to_type = conn["to_type"]
-                to_idx = conn["to_idx"]
-                typed_nodes = [(i, n) for i, (t, n) in enumerate(all_nodes) if t == to_type]
-                if to_idx < len(typed_nodes):
-                    to_id = typed_nodes[to_idx][1]
+                # Resolve "to" side
+                if "to_existing_idx" in conn:
+                    idx = conn["to_existing_idx"]
+                    if 0 <= idx < len(existing_node_ids):
+                        to_id = existing_node_ids[idx]
+                elif "to_idx" in conn and "to_type" in conn:
+                    to_type = conn["to_type"]
+                    to_idx = conn["to_idx"]
+                    typed_nodes = [(i, n) for i, (t, n) in enumerate(all_nodes) if t == to_type]
+                    if to_idx < len(typed_nodes):
+                        to_id = typed_nodes[to_idx][1]
 
-            if from_id and to_id:
-                graph.add_edge(from_id, to_id, weight=weight)
-                total_edges += 1
+                if from_id and to_id:
+                    graph.add_edge(from_id, to_id, weight=weight)
+                    from_node = graph.get_node(from_id)
+                    to_node = graph.get_node(to_id)
+                    dream_log.log_operation(run_id, "edge_created", None, None,
+                                            {"source_id": from_id, "target_id": to_id, "weight": weight,
+                                             "source_text": from_node["text"] if from_node else None,
+                                             "target_text": to_node["text"] if to_node else None})
+                    total_edges += 1
 
-        # Mark batch chunks as dreamed so they won't be reprocessed
-        # ChromaDB update() replaces metadata entirely, so carry forward existing fields
-        marked_metas = [{**m, "dreamed": 1} for m in batch_metas]
-        collection.update(
-            ids=batch_ids,
-            metadatas=marked_metas,
+            # Mark batch chunks as dreamed so they won't be reprocessed
+            _mark_chunks_dreamed(batch_ids, batch_metas)
+    except Exception as e:
+        run_error = str(e)
+        dream_log.log_operation(run_id, "error", None, None, {"message": str(e)})
+        raise
+    finally:
+        dream_log.finish_run(
+            run_id, error=run_error,
+            chunks_processed=len(docs),
+            nodes_created=total_vibes + total_details,
+            nodes_merged=total_merged,
+            edges_created=total_edges,
         )
 
     # Rebuild cache on server
@@ -476,111 +508,139 @@ def cmd_reconsolidate(args):
     reflection values affect edge weights. Unreflected recalls default to 0 (no effect).
     """
     graph = GraphStore()
+    dream_log = DreamLog(graph)
+    run_id = dream_log.start_run("reconsolidate")
+    run_error = None
 
     # 1. Get reflected recalls — the only signal for edge weight changes
     reflected_recalls = graph.get_reflected_recalls()
     edges_adjusted = 0
     affected_nodes: set[str] = set()
+    resynthesized = 0
 
-    if reflected_recalls:
-        print(f"Processing {len(reflected_recalls)} reflected recalls...")
+    try:
+        if reflected_recalls:
+            print(f"Processing {len(reflected_recalls)} reflected recalls...")
 
-        for recall in reflected_recalls:
-            query_emb = recall["query_embedding"]
+            for recall in reflected_recalls:
+                query_emb = recall["query_embedding"]
 
-            for result in recall["results"]:
-                reflection_code = result.get("reflection")
-                if not reflection_code or reflection_code not in REFLECTION_VALUES:
+                for result in recall["results"]:
+                    reflection_code = result.get("reflection")
+                    if not reflection_code or reflection_code not in REFLECTION_VALUES:
+                        continue
+
+                    reflection_value = REFLECTION_VALUES[reflection_code]
+                    if reflection_value == 0:
+                        continue  # NOISE = no change
+
+                    node_id = result["node_id"]
+                    affected_nodes.add(node_id)
+                    edges = graph.get_edges(node_id)
+                    if not edges:
+                        continue
+
+                    for edge in edges:
+                        neighbor_id = (
+                            edge["target_id"] if edge["source_id"] == node_id
+                            else edge["source_id"]
+                        )
+                        neighbor = graph.get_node(neighbor_id)
+                        if not neighbor:
+                            continue
+
+                        sim = _cosine_sim(query_emb, neighbor["embedding"])
+                        if sim <= 0:
+                            continue  # only adjust edges pointing toward the query
+
+                        delta = reflection_value * sim * REFLECTION_SCALE
+                        new_weight = _apply_reflection_delta(edge["weight"], delta)
+
+                        if new_weight != edge["weight"]:
+                            graph.update_edge_weight(
+                                edge["source_id"], edge["target_id"], new_weight,
+                            )
+                            source_node = graph.get_node(edge["source_id"])
+                            target_node = graph.get_node(edge["target_id"])
+                            dream_log.log_operation(
+                                run_id, "edge_adjusted", node_id, None,
+                                {"source_id": edge["source_id"], "target_id": edge["target_id"],
+                                 "old_weight": edge["weight"], "new_weight": new_weight,
+                                 "reflection": reflection_code, "delta": delta,
+                                 "source_text": source_node["text"] if source_node else None,
+                                 "target_text": target_node["text"] if target_node else None})
+                            edges_adjusted += 1
+                            if abs(delta) >= 0.01:
+                                print(f"  Edge {edge['source_id'][:8]}→{edge['target_id'][:8]}: "
+                                      f"{edge['weight']:.3f} → {new_weight:.3f} "
+                                      f"(reflection={reflection_code}, sim={sim:.2f})")
+        else:
+            print("No reflected recalls to process.")
+
+        # 2. Reconsolidate affected node embeddings
+        if affected_nodes:
+            print(f"\nReconsolidating {len(affected_nodes)} affected nodes...")
+
+            for node_id in affected_nodes:
+                node = graph.get_node(node_id)
+                if not node:
                     continue
 
-                reflection_value = REFLECTION_VALUES[reflection_code]
-                if reflection_value == 0:
-                    continue  # NOISE = no change
-
-                node_id = result["node_id"]
-                affected_nodes.add(node_id)
                 edges = graph.get_edges(node_id)
                 if not edges:
                     continue
 
+                # Compute weighted blend of self + neighbors
+                neighbor_embeddings = []
+                neighbor_weights = []
+                neighbor_texts = []
                 for edge in edges:
                     neighbor_id = (
                         edge["target_id"] if edge["source_id"] == node_id
                         else edge["source_id"]
                     )
                     neighbor = graph.get_node(neighbor_id)
-                    if not neighbor:
-                        continue
+                    if neighbor:
+                        neighbor_embeddings.append(neighbor["embedding"])
+                        neighbor_weights.append(edge["weight"])
+                        neighbor_texts.append(neighbor["text"])
 
-                    sim = _cosine_sim(query_emb, neighbor["embedding"])
-                    if sim <= 0:
-                        continue  # only adjust edges pointing toward the query
+                if not neighbor_embeddings:
+                    continue
 
-                    delta = reflection_value * sim * REFLECTION_SCALE
-                    new_weight = _apply_reflection_delta(edge["weight"], delta)
+                blended = _blend_embeddings(node["embedding"], neighbor_embeddings, neighbor_weights)
+                graph.update_node_embedding(node_id, blended)
 
-                    if new_weight != edge["weight"]:
-                        graph.update_edge_weight(
-                            edge["source_id"], edge["target_id"], new_weight,
-                        )
-                        edges_adjusted += 1
-                        if abs(delta) >= 0.01:
-                            print(f"  Edge {edge['source_id'][:8]}→{edge['target_id'][:8]}: "
-                                  f"{edge['weight']:.3f} → {new_weight:.3f} "
-                                  f"(reflection={reflection_code}, sim={sim:.2f})")
-    else:
-        print("No reflected recalls to process.")
+                # Check staleness: is the text still a good description of the embedding?
+                try:
+                    text_embedding = embed_text(node["text"])
+                    cosine_dist = _cosine_distance(text_embedding, blended)
 
-    # 2. Reconsolidate affected node embeddings
-    resynthesized = 0
-
-    if affected_nodes:
-        print(f"\nReconsolidating {len(affected_nodes)} affected nodes...")
-
-        for node_id in affected_nodes:
-            node = graph.get_node(node_id)
-            if not node:
-                continue
-
-            edges = graph.get_edges(node_id)
-            if not edges:
-                continue
-
-            # Compute weighted blend of self + neighbors
-            neighbor_embeddings = []
-            neighbor_weights = []
-            neighbor_texts = []
-            for edge in edges:
-                neighbor_id = (
-                    edge["target_id"] if edge["source_id"] == node_id
-                    else edge["source_id"]
-                )
-                neighbor = graph.get_node(neighbor_id)
-                if neighbor:
-                    neighbor_embeddings.append(neighbor["embedding"])
-                    neighbor_weights.append(edge["weight"])
-                    neighbor_texts.append(neighbor["text"])
-
-            if not neighbor_embeddings:
-                continue
-
-            blended = _blend_embeddings(node["embedding"], neighbor_embeddings, neighbor_weights)
-            graph.update_node_embedding(node_id, blended)
-
-            # Check staleness: is the text still a good description of the embedding?
-            try:
-                text_embedding = embed_text(node["text"])
-                cosine_dist = _cosine_distance(text_embedding, blended)
-
-                if cosine_dist > STALENESS_THRESHOLD:
-                    print(f"  Node {node_id[:8]}... stale (dist={cosine_dist:.3f}), re-synthesizing text...")
-                    new_text = resynthesize_text(node["text"], neighbor_texts)
-                    new_embedding = embed_text(new_text)
-                    graph.update_node_text(node_id, new_text, new_embedding)
-                    resynthesized += 1
-                    print(f"    → {new_text[:80]}")
-            except Exception as e:
-                print(f"  Warning: staleness check failed for {node_id[:8]}: {e}")
+                    if cosine_dist > STALENESS_THRESHOLD:
+                        print(f"  Node {node_id[:8]}... stale (dist={cosine_dist:.3f}), re-synthesizing text...")
+                        new_text = resynthesize_text(node["text"], neighbor_texts)
+                        new_embedding = embed_text(new_text)
+                        graph.update_node_text(node_id, new_text, new_embedding)
+                        dream_log.log_operation(
+                            run_id, "node_resynthesized", node_id, node["type"],
+                            {"old_text": node["text"], "new_text": new_text,
+                             "staleness": cosine_dist})
+                        resynthesized += 1
+                        print(f"    → {new_text[:80]}")
+                except Exception as e:
+                    print(f"  Warning: staleness check failed for {node_id[:8]}: {e}")
+                    dream_log.log_operation(run_id, "error", node_id, None,
+                                            {"message": f"Staleness check failed: {e}"})
+    except Exception as e:
+        run_error = str(e)
+        dream_log.log_operation(run_id, "error", None, None, {"message": str(e)})
+        raise
+    finally:
+        dream_log.finish_run(
+            run_id, error=run_error,
+            edges_adjusted=edges_adjusted,
+            nodes_resynthesized=resynthesized,
+        )
 
     # 3. Clear all recalls (reflected and unreflected) to prevent buildup
     graph.clear_processed_recalls()

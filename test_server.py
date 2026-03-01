@@ -229,6 +229,68 @@ def test_mmr_produces_diverse_results(client):
 # Deduplication
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# /chunks/undreamed and /chunks/mark_dreamed
+# ---------------------------------------------------------------------------
+
+def test_chunks_undreamed_returns_all_chunks(client):
+    """All seeded chunks should be undreamed initially."""
+    resp = client.get("/chunks/undreamed")
+    data = resp.json()
+    assert resp.status_code == 200
+    assert data["total"] >= 3
+    for chunk in data["chunks"]:
+        assert "id" in chunk
+        assert "text" in chunk
+        assert "metadata" in chunk
+
+
+def test_chunks_undreamed_days_filter(client):
+    """days=1 should exclude chunks from 2025."""
+    resp = client.get("/chunks/undreamed", params={"days": 1})
+    data = resp.json()
+    # Seed data is from 2025, so with days=1 from now (2026), nothing matches
+    assert data["total"] == 0
+
+
+def test_chunks_mark_dreamed(client):
+    """Marking a chunk as dreamed should remove it from undreamed results."""
+    # Get undreamed chunks
+    resp = client.get("/chunks/undreamed")
+    chunks = resp.json()["chunks"]
+    assert len(chunks) >= 1
+
+    target = chunks[0]
+    target_id = target["id"]
+    target_meta = target["metadata"]
+
+    # Mark it as dreamed
+    resp = client.post("/chunks/mark_dreamed", json={
+        "ids": [target_id],
+        "metadatas": [{**target_meta, "dreamed": 1}],
+    })
+    assert resp.status_code == 200
+    assert resp.json()["marked"] == 1
+
+    # Verify it's gone from undreamed
+    resp = client.get("/chunks/undreamed")
+    undreamed_ids = [c["id"] for c in resp.json()["chunks"]]
+    assert target_id not in undreamed_ids
+
+    # Restore it for other tests
+    resp = client.post("/chunks/mark_dreamed", json={
+        "ids": [target_id],
+        "metadatas": [{**target_meta, "dreamed": 0}],
+    })
+    assert resp.json()["marked"] == 1
+
+
+def test_chunks_mark_dreamed_empty(client):
+    """Empty ids list should return marked=0."""
+    resp = client.post("/chunks/mark_dreamed", json={"ids": [], "metadatas": []})
+    assert resp.json()["marked"] == 0
+
+
 def test_duplicate_ingest_does_not_create_duplicates(client):
     """Re-ingesting the same chunk (same session_id + turn_number) should not duplicate."""
     # Drain queue first — previous tests may have queued items still being processed

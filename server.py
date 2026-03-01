@@ -373,6 +373,11 @@ class ReflectOnRecallRequest(BaseModel):
     reflections: str  # comma-separated codes like "U,I,N,N,M"
 
 
+class MarkDreamedRequest(BaseModel):
+    ids: list[str]
+    metadatas: list[dict]
+
+
 class EmbedRequest(BaseModel):
     text: str
 
@@ -719,6 +724,50 @@ async def embed(req: EmbedRequest):
     return {"embedding": embedding.tolist()}
 
 
+@app.get("/chunks/undreamed")
+async def chunks_undreamed(
+    days: Optional[int] = Query(None, ge=1, description="Limit to last N days"),
+    limit: int = Query(10000, ge=1, description="Max chunks to return"),
+):
+    """Return conversation chunks that haven't been processed by dream yet."""
+    total = collection.count()
+    if total == 0:
+        return {"chunks": [], "total": 0}
+
+    results = collection.get(
+        where={"dreamed": {"$ne": 1}},
+        include=["documents", "metadatas"],
+        limit=total,  # get all undreamed, apply limit after optional date filter
+    )
+
+    chunks = []
+    for i, doc_id in enumerate(results["ids"]):
+        meta = results["metadatas"][i]
+        text = results["documents"][i]
+
+        if days is not None:
+            from datetime import datetime, timezone, timedelta
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            ts = meta.get("timestamp", "")
+            if ts < cutoff.isoformat():
+                continue
+
+        chunks.append({"id": doc_id, "text": text, "metadata": meta})
+        if len(chunks) >= limit:
+            break
+
+    return {"chunks": chunks, "total": len(chunks)}
+
+
+@app.post("/chunks/mark_dreamed")
+async def chunks_mark_dreamed(req: MarkDreamedRequest):
+    """Mark chunks as dreamed by updating their metadata."""
+    if not req.ids:
+        return {"marked": 0}
+    collection.update(ids=req.ids, metadatas=req.metadatas)
+    return {"marked": len(req.ids)}
+
+
 @app.post("/graph/reload_cache")
 async def reload_graph_cache():
     """Rebuild the graph store's in-memory embedding cache."""
@@ -802,6 +851,24 @@ async def graph_reflection_distribution():
 async def graph_reflection_timeline():
     """Reflection counts bucketed by hour for timeline chart."""
     return graph_store.reflection_timeline()
+
+
+@app.get("/graph/dream-runs")
+async def graph_dream_runs(
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Recent dream runs."""
+    from graph import DreamLog
+    dream_log = DreamLog(graph_store)
+    return {"runs": dream_log.list_runs(limit=limit)}
+
+
+@app.get("/graph/dream-runs/{run_id}/operations")
+async def graph_dream_run_operations(run_id: str):
+    """Operations for a specific dream run."""
+    from graph import DreamLog
+    dream_log = DreamLog(graph_store)
+    return {"operations": dream_log.get_run_operations(run_id)}
 
 
 @app.get("/stats")
