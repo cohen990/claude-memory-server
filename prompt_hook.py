@@ -15,10 +15,33 @@ import urllib.request
 import urllib.error
 
 SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
+# SURPRISAL_GATE: "1" = enforce gate, "0" = log-only (always retrieve)
+SURPRISAL_GATE = os.environ.get("SURPRISAL_GATE", "0")
+
+
+def check_surprisal(text: str) -> dict | None:
+    """Ask the server whether this query should trigger retrieval.
+
+    Returns the gate decision dict, or None on error (fail-open).
+    """
+    body = json.dumps({"text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{SERVER_URL}/surprisal",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
 
 
 def search_graph(query: str, k: int = 5, session_id: str = "",
-                  min_similarity: float = 0.5) -> dict:
+                  min_similarity: float = 0.5,
+                  general_surprisal: float | None = None,
+                  personal_surprisal: float | None = None) -> dict:
     """Search the graph memory layer for synthesized long-term memories.
 
     Returns {"results": [...], "recall_id": str|None}.
@@ -27,6 +50,10 @@ def search_graph(query: str, k: int = 5, session_id: str = "",
     """
     body = {"q": query, "k": k, "expand_neighbors": True,
             "min_similarity": min_similarity}
+    if general_surprisal is not None:
+        body["general_surprisal"] = general_surprisal
+    if personal_surprisal is not None:
+        body["personal_surprisal"] = personal_surprisal
     if session_id:
         body["session_id"] = session_id
     payload = json.dumps(body).encode("utf-8")
@@ -89,8 +116,32 @@ def main():
     else:
         query = prompt
 
-    # Graph memory search — pass session_id so recalls are tagged
-    graph_data = search_graph(query, k=5, session_id=current_session)
+    # Surprisal gate — skip retrieval for filler or novel-topic queries
+    gate = check_surprisal(prompt)  # gate on raw prompt, not prompt+context
+    if gate:
+        gen_s = gate.get("general_surprisal", 0)
+        pers_s = gate.get("personal_surprisal", 0)
+        reason = gate.get("reason", "?")
+        if not gate.get("retrieve", True):
+            if SURPRISAL_GATE == "1":
+                # Gate enforced — skip retrieval
+                print(f"[surprisal] skipped: {reason} "
+                      f"(gen={gen_s:.1f}, pers={pers_s:.1f})",
+                      file=sys.stderr)
+                return
+            else:
+                # Log-only mode — continue but log the decision
+                print(f"[surprisal] would skip: {reason} "
+                      f"(gen={gen_s:.1f}, pers={pers_s:.1f})",
+                      file=sys.stderr)
+
+    # Graph memory search — pass session_id and surprisal scores so they're
+    # stored alongside the recall for calibration analysis.
+    gate_gen = gate.get("general_surprisal") if gate else None
+    gate_pers = gate.get("personal_surprisal") if gate else None
+    graph_data = search_graph(query, k=5, session_id=current_session,
+                              general_surprisal=gate_gen,
+                              personal_surprisal=gate_pers)
     graph_results = graph_data.get("results", [])
     recall_id = graph_data.get("recall_id")
     if not graph_results:

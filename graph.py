@@ -126,6 +126,16 @@ class GraphStore:
                 FOREIGN KEY (node_id) REFERENCES nodes(id)
             );
 
+            CREATE TABLE IF NOT EXISTS english_word_freqs (
+                word TEXT PRIMARY KEY,
+                log_prob REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS personal_word_counts (
+                word TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+
         """)
         # Partial index for activated edges — sqlite requires separate statement
         try:
@@ -150,6 +160,10 @@ class GraphStore:
             self.conn.execute("ALTER TABLE recalls ADD COLUMN query_text TEXT")
         if "dreamed_at" not in cols:
             self.conn.execute("ALTER TABLE recalls ADD COLUMN dreamed_at TEXT")
+        if "general_surprisal" not in cols:
+            self.conn.execute("ALTER TABLE recalls ADD COLUMN general_surprisal REAL")
+        if "personal_surprisal" not in cols:
+            self.conn.execute("ALTER TABLE recalls ADD COLUMN personal_surprisal REAL")
         self.conn.execute("DROP TABLE IF EXISTS rating_events")
 
         # Rename rating → reflection in recall_results
@@ -514,15 +528,20 @@ class GraphStore:
     def create_recall(self, query_embedding: np.ndarray,
                       results: list[dict],
                       session_id: str | None = None,
-                      query_text: str | None = None) -> str:
+                      query_text: str | None = None,
+                      general_surprisal: float | None = None,
+                      personal_surprisal: float | None = None) -> str:
         """Store a recall (search event) and its ordered results. Returns recall ID."""
         recall_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
         self.conn.execute(
-            "INSERT INTO recalls (id, query_embedding, created_at, session_id, query_text) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (recall_id, embedding_to_blob(query_embedding), now, session_id, query_text),
+            "INSERT INTO recalls "
+            "(id, query_embedding, created_at, session_id, query_text, "
+            " general_surprisal, personal_surprisal) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (recall_id, embedding_to_blob(query_embedding), now, session_id,
+             query_text, general_surprisal, personal_surprisal),
         )
         for i, r in enumerate(results):
             self.conn.execute(
@@ -605,19 +624,21 @@ class GraphStore:
         """
         if session_id:
             rows = self.conn.execute(
-                "SELECT id, created_at, session_id, query_text FROM recalls "
+                "SELECT id, created_at, session_id, query_text, "
+                "general_surprisal, personal_surprisal FROM recalls "
                 "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT id, created_at, session_id, query_text FROM recalls "
+                "SELECT id, created_at, session_id, query_text, "
+                "general_surprisal, personal_surprisal FROM recalls "
                 "ORDER BY created_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
 
         recalls = []
-        for recall_id, created_at, sess_id, query_text in rows:
+        for recall_id, created_at, sess_id, query_text, gen_s, pers_s in rows:
             results = self.conn.execute(
                 "SELECT rr.node_id, rr.similarity, rr.source, "
                 "rr.connected_via, rr.reflection, n.type, n.text "
@@ -632,6 +653,8 @@ class GraphStore:
                 "created_at": created_at,
                 "session_id": sess_id,
                 "query_text": query_text,
+                "general_surprisal": gen_s,
+                "personal_surprisal": pers_s,
                 "results": [
                     {
                         "node_id": r[0],
@@ -914,6 +937,83 @@ class GraphStore:
                 buckets[bucket_str][reflection] = count
 
         return list(buckets.values())
+
+    # ------------------------------------------------------------------
+    # Word frequency tables (for surprisal gate)
+    # ------------------------------------------------------------------
+
+    def load_english_freqs(self, freqs: dict[str, float]):
+        """Bulk-load english word frequencies. freqs: {word: log_prob}.
+
+        Replaces any existing data.
+        """
+        self.conn.execute("DELETE FROM english_word_freqs")
+        self.conn.executemany(
+            "INSERT INTO english_word_freqs (word, log_prob) VALUES (?, ?)",
+            freqs.items(),
+        )
+        self.conn.commit()
+
+    def get_english_log_prob(self, word: str) -> float | None:
+        """Return log_prob for a single english word, or None if unseen."""
+        row = self.conn.execute(
+            "SELECT log_prob FROM english_word_freqs WHERE word = ?", (word,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def get_english_log_probs(self, words: list[str]) -> dict[str, float]:
+        """Return {word: log_prob} for words found in the english table."""
+        if not words:
+            return {}
+        placeholders = ",".join("?" for _ in words)
+        rows = self.conn.execute(
+            f"SELECT word, log_prob FROM english_word_freqs "
+            f"WHERE word IN ({placeholders})", words
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def english_freq_count(self) -> int:
+        """Number of words in the english frequency table."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM english_word_freqs"
+        ).fetchone()
+        return row[0]
+
+    def update_personal_word_counts(self, words: list[str]):
+        """Increment counts for each word in the personal corpus."""
+        if not words:
+            return
+        self.conn.executemany(
+            "INSERT INTO personal_word_counts (word, count) VALUES (?, 1) "
+            "ON CONFLICT(word) DO UPDATE SET count = count + 1",
+            [(w,) for w in words],
+        )
+        self.conn.commit()
+
+    def get_personal_word_counts(self, words: list[str]) -> dict[str, int]:
+        """Return {word: count} for words found in the personal table."""
+        if not words:
+            return {}
+        placeholders = ",".join("?" for _ in words)
+        rows = self.conn.execute(
+            f"SELECT word, count FROM personal_word_counts "
+            f"WHERE word IN ({placeholders})", words
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def personal_corpus_total(self) -> int:
+        """Total word count across all personal entries."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM personal_word_counts"
+        ).fetchone()
+        return row[0]
+
+    def personal_vocab_size(self) -> int:
+        """Number of distinct words in the personal corpus."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM personal_word_counts"
+        ).fetchone()
+        return row[0]
 
     # ------------------------------------------------------------------
     # Stats

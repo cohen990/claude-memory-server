@@ -24,6 +24,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
+from surprisal import tokenize, should_retrieve
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -207,6 +209,11 @@ def process_one_file(path: Path):
             }],
         )
 
+        # Update personal word frequency counts for surprisal gate
+        words = tokenize(user_text)
+        if words and graph_store:
+            graph_store.update_personal_word_counts(words)
+
     path.unlink()
 
 
@@ -362,6 +369,8 @@ class GraphSearchRequest(BaseModel):
     node_type: Optional[str] = None
     session_id: Optional[str] = None
     min_similarity: Optional[float] = None
+    general_surprisal: Optional[float] = None
+    personal_surprisal: Optional[float] = None
 
 
 class ListRecallsRequest(BaseModel):
@@ -380,6 +389,10 @@ class MarkDreamedRequest(BaseModel):
 
 
 class EmbedRequest(BaseModel):
+    text: str
+
+
+class SurprisalRequest(BaseModel):
     text: str
 
 
@@ -672,6 +685,8 @@ async def search_graph(req: GraphSearchRequest):
         recall_id = graph_store.create_recall(
             np.asarray(query_embedding, dtype=np.float32), results,
             session_id=req.session_id, query_text=req.q,
+            general_surprisal=req.general_surprisal,
+            personal_surprisal=req.personal_surprisal,
         )
 
     return {"results": results, "recall_id": recall_id}
@@ -726,6 +741,24 @@ async def embed(req: EmbedRequest):
         [DOCUMENT_PREFIX + req.text], show_progress_bar=False,
     )[0]
     return {"embedding": embedding.tolist()}
+
+
+@app.post("/surprisal")
+async def surprisal(req: SurprisalRequest):
+    """Compute surprisal scores for query text against both corpora.
+
+    Used by the prompt hook to gate memory retrieval.
+    """
+    words = tokenize(req.text)
+    english_probs = graph_store.get_english_log_probs(words)
+    personal_counts = graph_store.get_personal_word_counts(words)
+    corpus_total = graph_store.personal_corpus_total()
+    vocab_size = graph_store.personal_vocab_size()
+
+    result = should_retrieve(
+        req.text, english_probs, personal_counts, corpus_total, vocab_size,
+    )
+    return result
 
 
 @app.get("/chunks/undreamed")

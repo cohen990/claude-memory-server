@@ -263,6 +263,18 @@ main {
   font-size: inherit;
 }
 .session-link:hover { text-decoration: underline; }
+.recall-surprisal {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  font-family: var(--font-mono, monospace);
+}
+.recall-surprisal-ratio {
+  color: var(--text);
+  font-weight: 600;
+}
 .recall-query {
   margin-bottom: 8px;
   font-size: 12px;
@@ -331,6 +343,7 @@ main {
 .reflection-N { background: var(--reflection-N); }
 .reflection-D { background: var(--reflection-D); }
 .reflection-M { background: var(--reflection-M); }
+.reflection-pending { background: var(--border); color: var(--text-dim); }
 
 .recalls-more {
   display: block;

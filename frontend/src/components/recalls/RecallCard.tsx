@@ -33,6 +33,29 @@ export default function RecallCard({ recall, onSessionClick }: RecallCardProps) 
         )}
       </div>
 
+      {(recall.general_surprisal != null || recall.personal_surprisal != null) && (
+        <div className="recall-surprisal">
+          {recall.general_surprisal != null && recall.personal_surprisal != null && recall.personal_surprisal > 0 && (
+            <span
+              className="recall-surprisal-ratio"
+              title="gen/pers ratio (higher = better retrieval candidate)"
+            >
+              {(recall.general_surprisal / recall.personal_surprisal).toFixed(2)}
+            </span>
+          )}
+          {recall.general_surprisal != null && (
+            <span title="General surprisal (higher = more substantive)">
+              gen: {recall.general_surprisal.toFixed(1)}
+            </span>
+          )}
+          {recall.personal_surprisal != null && (
+            <span title="Personal surprisal (lower = more familiar)">
+              pers: {recall.personal_surprisal.toFixed(1)}
+            </span>
+          )}
+        </div>
+      )}
+
       {recall.query_text && (
         <details className="recall-query">
           <summary>Query</summary>
@@ -52,7 +75,7 @@ export default function RecallCard({ recall, onSessionClick }: RecallCardProps) 
             <span className="recall-result-sim">
               {(r.similarity || 0).toFixed(3)}
             </span>{' '}
-            {r.reflection && <ReflectionBadge code={r.reflection} />}
+            <ReflectionBadge code={r.reflection || '?'} />
           </span>
         </div>
       ))}

@@ -53,6 +53,8 @@ export interface Recall {
   created_at: string
   session_id: string | null
   query_text?: string
+  general_surprisal?: number | null
+  personal_surprisal?: number | null
   results: RecallResult[]
 }
 
