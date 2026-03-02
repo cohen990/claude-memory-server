@@ -229,6 +229,9 @@ def run_as_hook():
     Reads hook context from stdin, extracts the latest turn pair from the
     transcript, and ingests it.
     """
+    if os.environ.get("MEMORY_DISABLED", "").strip() == "1":
+        return
+
     try:
         hook_input = json.loads(sys.stdin.read())
     except (json.JSONDecodeError, ValueError):

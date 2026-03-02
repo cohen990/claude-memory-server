@@ -19,6 +19,7 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 log = logging.getLogger("memory-bridge")
 
 SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
+MEMORY_DISABLED = os.environ.get("MEMORY_DISABLED", "").strip() == "1"
 
 mcp = FastMCP("memory")
 
@@ -40,6 +41,8 @@ async def search_memory(query: str, k: int = 10, project: Optional[str] = None,
         session_id: Optional session ID to restrict search to a specific conversation.
         exclude_session_id: Optional session ID to exclude (use your current session ID to avoid self-referential results).
     """
+    if MEMORY_DISABLED:
+        return "Memory is disabled (MEMORY_DISABLED=1)."
     body = {"q": query, "k": k}
     if project:
         body["project"] = project
@@ -108,6 +111,8 @@ async def search_memory_detail(
         session_id: Optional session ID to restrict search to a specific conversation.
         exclude_session_id: Optional session ID to exclude (use your current session ID to avoid self-referential results).
     """
+    if MEMORY_DISABLED:
+        return "Memory is disabled (MEMORY_DISABLED=1)."
     body = {"q": query, "k": k}
     if project:
         body["project"] = project
@@ -174,6 +179,8 @@ async def search_memory_graph(
         expand_neighbors: Whether to include graph neighbors of top results (default True).
         node_type: Optional filter: "vibe" or "detail".
     """
+    if MEMORY_DISABLED:
+        return "Memory is disabled (MEMORY_DISABLED=1)."
     body: dict = {"q": query, "k": k, "expand_neighbors": expand_neighbors}
     if node_type:
         body["node_type"] = node_type
@@ -226,6 +233,8 @@ async def search_memory_graph(
 @mcp.tool()
 async def memory_stats() -> str:
     """Return statistics about the memory store (total documents, etc.)."""
+    if MEMORY_DISABLED:
+        return "Memory is disabled (MEMORY_DISABLED=1)."
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(f"{SERVER_URL}/stats")
@@ -256,6 +265,8 @@ async def list_recalls(session_id: str, limit: int = 1) -> str:
         session_id: The session ID to filter recalls for.
         limit: Number of recent recalls to return (default 1).
     """
+    if MEMORY_DISABLED:
+        return "Memory is disabled (MEMORY_DISABLED=1)."
     body = {"session_id": session_id, "limit": limit}
 
     try:
@@ -325,6 +336,8 @@ async def reflect(r: str):
     Args:
         r: Compact reflection string like "abc123:U,I,N,N,M"
     """
+    if MEMORY_DISABLED:
+        return "Memory is disabled (MEMORY_DISABLED=1)."
     if ":" not in r:
         return "Error: expected format recall_id:U,I,N,N,M"
 

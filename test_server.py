@@ -329,3 +329,78 @@ def test_duplicate_ingest_does_not_create_duplicates(client):
 
     after = client.get("/stats").json()["total_documents"]
     assert after == before, f"Expected {before} docs, got {after} — duplicate was inserted"
+
+
+# ---------------------------------------------------------------------------
+# /delete
+# ---------------------------------------------------------------------------
+
+def test_delete_requires_filter(client):
+    """Must specify session_ids or project."""
+    resp = client.post("/delete", json={"dry_run": True})
+    assert resp.status_code == 400
+
+
+def test_delete_dry_run_by_session(client):
+    """Dry run should report counts without deleting anything."""
+    before = client.get("/stats").json()
+
+    resp = client.post("/delete", json={
+        "session_ids": ["session-bbb"],
+        "dry_run": True,
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["dry_run"] is True
+    assert data["chunks"] == 1       # session-bbb has 1 chunk
+    assert data["user_inputs"] == 1
+    assert data["subchunks"] > 0
+
+    # Nothing actually deleted
+    after = client.get("/stats").json()
+    assert after["total_documents"] == before["total_documents"]
+
+
+def test_delete_dry_run_by_project(client):
+    """Dry run by project should find matching chunks."""
+    resp = client.post("/delete", json={
+        "project": "/home/user/acme",
+        "dry_run": True,
+    })
+    data = resp.json()
+    assert data["chunks"] >= 2  # session-aaa has 2+ chunks in acme (summary may add more)
+
+
+def test_delete_by_session(client):
+    """Deleting session-bbb should remove it from all collections."""
+    before = client.get("/stats").json()
+
+    resp = client.post("/delete", json={
+        "session_ids": ["session-bbb"],
+        "dry_run": False,
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["dry_run"] is False
+    assert data["chunks"] == 1
+
+    after = client.get("/stats").json()
+    assert after["total_documents"] == before["total_documents"] - 1
+    assert after["total_user_inputs"] == before["total_user_inputs"] - 1
+    assert after["total_subchunks"] == before["total_subchunks"] - data["subchunks"]
+
+    # session-bbb should no longer appear in search
+    resp = client.post("/search", json={
+        "q": "decorators",
+        "k": 10,
+        "session_id": "session-bbb",
+    })
+    assert len(resp.json()["results"]) == 0
+
+    # session-aaa should still be intact
+    resp = client.post("/search", json={
+        "q": "parser",
+        "k": 10,
+        "session_id": "session-aaa",
+    })
+    assert len(resp.json()["results"]) > 0

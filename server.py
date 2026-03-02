@@ -383,6 +383,12 @@ class ReflectOnRecallRequest(BaseModel):
     reflections: str  # comma-separated codes like "U,I,N,N,M"
 
 
+class DeleteRequest(BaseModel):
+    session_ids: list[str] | None = None
+    project: str | None = None
+    dry_run: bool = True  # default to dry run for safety
+
+
 class MarkDreamedRequest(BaseModel):
     ids: list[str]
     metadatas: list[dict]
@@ -913,6 +919,93 @@ async def graph_dream_run_operations(run_id: str):
     from graph import DreamLog
     dream_log = DreamLog(graph_store)
     return {"operations": dream_log.get_run_operations(run_id)}
+
+
+@app.post("/delete")
+async def delete_chunks(req: DeleteRequest):
+    """Delete chunks by session IDs or project.
+
+    Removes matching documents from all three ChromaDB collections
+    (conversations, subchunks, user_inputs) and cleans up graph nodes
+    whose source_ids become empty after removal.
+
+    Defaults to dry_run=true — set dry_run=false to actually delete.
+    """
+    if not req.session_ids and not req.project:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Must specify session_ids or project"},
+        )
+
+    # Build where filter
+    if req.session_ids:
+        if len(req.session_ids) == 1:
+            where = {"session_id": req.session_ids[0]}
+        else:
+            where = {"session_id": {"$in": req.session_ids}}
+    else:
+        where = {"project": req.project}
+
+    # Find matching IDs in each collection
+    chunk_ids = collection.get(where=where, include=[])["ids"]
+    subchunk_ids = subchunk_collection.get(where=where, include=[])["ids"]
+    user_input_ids = user_input_collection.get(where=where, include=[])["ids"]
+
+    result = {
+        "chunks": len(chunk_ids),
+        "subchunks": len(subchunk_ids),
+        "user_inputs": len(user_input_ids),
+        "dry_run": req.dry_run,
+    }
+
+    # Check graph nodes that reference these chunk IDs
+    orphaned_nodes = []
+    if graph_store and chunk_ids:
+        cursor = graph_store.conn.execute(
+            "SELECT id, source_ids FROM nodes"
+        )
+        for node_id, source_ids_json in cursor:
+            source_ids = json.loads(source_ids_json) if source_ids_json else []
+            remaining = [s for s in source_ids if s not in set(chunk_ids)]
+            if not remaining and source_ids:
+                orphaned_nodes.append(node_id)
+        result["orphaned_graph_nodes"] = len(orphaned_nodes)
+
+    if req.dry_run:
+        return result
+
+    # Actually delete
+    if chunk_ids:
+        # ChromaDB .delete() has a batch limit; chunk in groups
+        for i in range(0, len(chunk_ids), 500):
+            collection.delete(ids=chunk_ids[i:i+500])
+    if subchunk_ids:
+        for i in range(0, len(subchunk_ids), 500):
+            subchunk_collection.delete(ids=subchunk_ids[i:i+500])
+    if user_input_ids:
+        for i in range(0, len(user_input_ids), 500):
+            user_input_collection.delete(ids=user_input_ids[i:i+500])
+
+    # Remove orphaned graph nodes and their edges
+    if graph_store and orphaned_nodes:
+        for node_id in orphaned_nodes:
+            graph_store.conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?",
+                                    (node_id, node_id))
+            graph_store.conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+        graph_store.conn.commit()
+        # Rebuild the in-memory cache
+        graph_store._build_embedding_cache()
+        result["graph_nodes_deleted"] = len(orphaned_nodes)
+
+    # Also remove recalls for deleted sessions
+    if graph_store and req.session_ids:
+        for sid in req.session_ids:
+            graph_store.conn.execute("DELETE FROM recall_results WHERE recall_id IN "
+                                    "(SELECT recall_id FROM recalls WHERE session_id = ?)", (sid,))
+            graph_store.conn.execute("DELETE FROM recalls WHERE session_id = ?", (sid,))
+        graph_store.conn.commit()
+
+    return result
 
 
 @app.get("/stats")
