@@ -65,7 +65,7 @@ def test_embedding_roundtrip():
 
 def test_schema_created(store):
     """Tables and indexes should exist after init."""
-    tables = store.conn.execute(
+    tables = store._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall()
     table_names = {t[0] for t in tables}
@@ -437,7 +437,7 @@ def test_create_recall(store):
     assert recall_id  # non-empty
 
     # Verify stored
-    row = store.conn.execute(
+    row = store._conn.execute(
         "SELECT COUNT(*) FROM recall_results WHERE recall_id = ?",
         (recall_id,),
     ).fetchone()
@@ -456,7 +456,7 @@ def test_reflect_on_recall(store):
 
     store.reflect_on_recall(recall_id, ["U", "N"])
 
-    rows = store.conn.execute(
+    rows = store._conn.execute(
         "SELECT position, reflection FROM recall_results WHERE recall_id = ? ORDER BY position",
         (recall_id,),
     ).fetchall()
@@ -509,14 +509,14 @@ def test_clear_reflected_recalls(store):
     store.clear_reflected_recalls()
 
     # r1 should be marked as dreamed
-    row = store.conn.execute(
+    row = store._conn.execute(
         "SELECT dreamed_at FROM recalls WHERE id = ?", (r1,)
     ).fetchone()
     assert row is not None
     assert row[0] is not None
 
     # r2 should remain un-dreamed
-    row = store.conn.execute(
+    row = store._conn.execute(
         "SELECT dreamed_at FROM recalls WHERE id = ?", (r2,)
     ).fetchone()
     assert row is not None
@@ -542,20 +542,20 @@ def test_clear_processed_recalls(store):
 
     # Both should still exist but have dreamed_at set
     for rid in (r1, r2):
-        row = store.conn.execute(
+        row = store._conn.execute(
             "SELECT dreamed_at FROM recalls WHERE id = ?", (rid,)
         ).fetchone()
         assert row is not None
         assert row[0] is not None  # dreamed_at is set
 
     # recall_results should still be intact
-    row = store.conn.execute("SELECT COUNT(*) FROM recall_results").fetchone()
+    row = store._conn.execute("SELECT COUNT(*) FROM recall_results").fetchone()
     assert row[0] == 2
 
 
 def test_schema_has_recall_tables(store):
     """Recall tables should exist after init."""
-    tables = store.conn.execute(
+    tables = store._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall()
     table_names = {t[0] for t in tables}
@@ -576,7 +576,7 @@ def test_create_recall_with_session_id(store):
         session_id="sess-abc-123",
     )
 
-    row = store.conn.execute(
+    row = store._conn.execute(
         "SELECT session_id FROM recalls WHERE id = ?", (recall_id,)
     ).fetchone()
     assert row[0] == "sess-abc-123"
@@ -590,7 +590,7 @@ def test_create_recall_without_session_id(store):
         [{"id": id1, "similarity": 0.9, "source": "seed"}],
     )
 
-    row = store.conn.execute(
+    row = store._conn.execute(
         "SELECT session_id FROM recalls WHERE id = ?", (recall_id,)
     ).fetchone()
     assert row[0] is None
@@ -992,7 +992,7 @@ def test_reflections_survive_clear_processed_recalls(store):
     store.clear_processed_recalls()
 
     # Recall data still exists
-    count = store.conn.execute("SELECT COUNT(*) FROM recall_results").fetchone()[0]
+    count = store._conn.execute("SELECT COUNT(*) FROM recall_results").fetchone()[0]
     assert count == 2
 
     # Reflection data persists for charts
@@ -1145,13 +1145,13 @@ def test_migrate_adds_session_id(tmp_path):
     gs = GraphStore(db_path=db_path)
     recall_cols = {
         row[1] for row in
-        gs.conn.execute("PRAGMA table_info(recalls)").fetchall()
+        gs._conn.execute("PRAGMA table_info(recalls)").fetchall()
     }
     assert "session_id" in recall_cols
 
     rr_cols = {
         row[1] for row in
-        gs.conn.execute("PRAGMA table_info(recall_results)").fetchall()
+        gs._conn.execute("PRAGMA table_info(recall_results)").fetchall()
     }
     assert "reflection" in rr_cols
     assert "rating" not in rr_cols
@@ -1170,7 +1170,7 @@ def dream_log(store):
 
 def test_dream_schema_created(store):
     """dream_runs and dream_operations tables should exist."""
-    tables = store.conn.execute(
+    tables = store._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall()
     table_names = {t[0] for t in tables}
@@ -1184,7 +1184,7 @@ def test_start_run(dream_log):
     assert run_id
     assert len(run_id) == 36  # UUID format
 
-    row = dream_log.conn.execute(
+    row = dream_log._graph_store._conn.execute(
         "SELECT type, started_at, finished_at FROM dream_runs WHERE id = ?",
         (run_id,),
     ).fetchone()

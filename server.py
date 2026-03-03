@@ -283,7 +283,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize graph store
     from graph import GraphStore
-    graph_store = GraphStore()
+    graph_store = GraphStore(check_same_thread=False)
     gs = graph_store.stats()
     print(f"Graph store ready ({gs['total_nodes']} nodes, {gs['total_edges']} edges).")
 
@@ -712,10 +712,11 @@ async def reflect_on_recall(req: ReflectOnRecallRequest):
             )
 
     # Verify recall exists and check result count
-    row = graph_store.conn.execute(
-        "SELECT COUNT(*) FROM recall_results WHERE recall_id = ?",
-        (req.recall_id,),
-    ).fetchone()
+    with graph_store._db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM recall_results WHERE recall_id = ?",
+            (req.recall_id,),
+        ).fetchone()
     if not row or row[0] == 0:
         return JSONResponse(
             status_code=404,
@@ -961,14 +962,15 @@ async def delete_chunks(req: DeleteRequest):
     # Check graph nodes that reference these chunk IDs
     orphaned_nodes = []
     if graph_store and chunk_ids:
-        cursor = graph_store.conn.execute(
-            "SELECT id, source_ids FROM nodes"
-        )
-        for node_id, source_ids_json in cursor:
-            source_ids = json.loads(source_ids_json) if source_ids_json else []
-            remaining = [s for s in source_ids if s not in set(chunk_ids)]
-            if not remaining and source_ids:
-                orphaned_nodes.append(node_id)
+        with graph_store._db() as conn:
+            cursor = conn.execute(
+                "SELECT id, source_ids FROM nodes"
+            )
+            for node_id, source_ids_json in cursor:
+                source_ids = json.loads(source_ids_json) if source_ids_json else []
+                remaining = [s for s in source_ids if s not in set(chunk_ids)]
+                if not remaining and source_ids:
+                    orphaned_nodes.append(node_id)
         result["orphaned_graph_nodes"] = len(orphaned_nodes)
 
     if req.dry_run:
@@ -988,22 +990,24 @@ async def delete_chunks(req: DeleteRequest):
 
     # Remove orphaned graph nodes and their edges
     if graph_store and orphaned_nodes:
-        for node_id in orphaned_nodes:
-            graph_store.conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?",
-                                    (node_id, node_id))
-            graph_store.conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
-        graph_store.conn.commit()
+        with graph_store._db() as conn:
+            for node_id in orphaned_nodes:
+                conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?",
+                             (node_id, node_id))
+                conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+            conn.commit()
         # Rebuild the in-memory cache
-        graph_store._build_embedding_cache()
+        graph_store._rebuild_cache()
         result["graph_nodes_deleted"] = len(orphaned_nodes)
 
     # Also remove recalls for deleted sessions
     if graph_store and req.session_ids:
-        for sid in req.session_ids:
-            graph_store.conn.execute("DELETE FROM recall_results WHERE recall_id IN "
-                                    "(SELECT recall_id FROM recalls WHERE session_id = ?)", (sid,))
-            graph_store.conn.execute("DELETE FROM recalls WHERE session_id = ?", (sid,))
-        graph_store.conn.commit()
+        with graph_store._db() as conn:
+            for sid in req.session_ids:
+                conn.execute("DELETE FROM recall_results WHERE recall_id IN "
+                             "(SELECT recall_id FROM recalls WHERE session_id = ?)", (sid,))
+                conn.execute("DELETE FROM recalls WHERE session_id = ?", (sid,))
+            conn.commit()
 
     return result
 

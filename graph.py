@@ -5,13 +5,20 @@ graph operations. Nodes hold synthesized memories (vibes/details) with
 embeddings; edges encode weighted associations between them. Search
 walks the graph neighborhood; recalls and agent reflections drive edge
 weight changes during dream reconsolidation.
+
+Thread safety: all database access is serialized through _db(), a
+context manager that acquires a lock and yields the raw connection.
+This lets GraphStore be used safely from both the async event loop
+and background executor threads (e.g. the queue worker).
 """
 
 import json
 import math
 import os
 import sqlite3
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import networkx as nx
@@ -48,15 +55,27 @@ class GraphStore:
                  check_same_thread: bool = True):
         self.db_path = db_path or GRAPH_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path,
-                                    check_same_thread=check_same_thread)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA busy_timeout=5000")
+        self._conn = sqlite3.connect(self.db_path,
+                                     check_same_thread=check_same_thread)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._lock = threading.Lock()
         self._create_schema()
         self._rebuild_cache()
 
+    @contextmanager
+    def _db(self):
+        """Acquire the lock and yield the raw connection.
+
+        All database access goes through this so that GraphStore is
+        thread-safe when used from both the async event loop and
+        background executor threads.
+        """
+        with self._lock:
+            yield self._conn
+
     def _create_schema(self):
-        self.conn.executescript("""
+        self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS nodes (
                 id TEXT PRIMARY KEY,
                 type TEXT NOT NULL,
@@ -139,46 +158,46 @@ class GraphStore:
         """)
         # Partial index for activated edges — sqlite requires separate statement
         try:
-            self.conn.execute(
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_edges_activated "
                 "ON edges(activation_count) WHERE activation_count > 0"
             )
         except sqlite3.OperationalError:
             pass  # partial indexes not supported on all builds
         self._migrate()
-        self.conn.commit()
+        self._conn.commit()
 
     def _migrate(self):
         """Run schema migrations for columns added after initial release."""
         cols = {
             row[1] for row in
-            self.conn.execute("PRAGMA table_info(recalls)").fetchall()
+            self._conn.execute("PRAGMA table_info(recalls)").fetchall()
         }
         if "session_id" not in cols:
-            self.conn.execute("ALTER TABLE recalls ADD COLUMN session_id TEXT")
+            self._conn.execute("ALTER TABLE recalls ADD COLUMN session_id TEXT")
         if "query_text" not in cols:
-            self.conn.execute("ALTER TABLE recalls ADD COLUMN query_text TEXT")
+            self._conn.execute("ALTER TABLE recalls ADD COLUMN query_text TEXT")
         if "dreamed_at" not in cols:
-            self.conn.execute("ALTER TABLE recalls ADD COLUMN dreamed_at TEXT")
+            self._conn.execute("ALTER TABLE recalls ADD COLUMN dreamed_at TEXT")
         if "general_surprisal" not in cols:
-            self.conn.execute("ALTER TABLE recalls ADD COLUMN general_surprisal REAL")
+            self._conn.execute("ALTER TABLE recalls ADD COLUMN general_surprisal REAL")
         if "personal_surprisal" not in cols:
-            self.conn.execute("ALTER TABLE recalls ADD COLUMN personal_surprisal REAL")
-        self.conn.execute("DROP TABLE IF EXISTS rating_events")
+            self._conn.execute("ALTER TABLE recalls ADD COLUMN personal_surprisal REAL")
+        self._conn.execute("DROP TABLE IF EXISTS rating_events")
 
         # Rename rating → reflection in recall_results
         rr_cols = {
             row[1] for row in
-            self.conn.execute("PRAGMA table_info(recall_results)").fetchall()
+            self._conn.execute("PRAGMA table_info(recall_results)").fetchall()
         }
         if "rating" in rr_cols and "reflection" not in rr_cols:
-            self.conn.execute(
+            self._conn.execute(
                 "ALTER TABLE recall_results RENAME COLUMN rating TO reflection"
             )
 
     def _rebuild_cache(self):
         """Load all node embeddings into a pre-normalized numpy matrix."""
-        rows = self.conn.execute(
+        rows = self._conn.execute(
             "SELECT id, embedding FROM nodes"
         ).fetchall()
 
@@ -236,22 +255,24 @@ class GraphStore:
         now = datetime.now(timezone.utc).isoformat()
         source_ids_json = json.dumps(source_ids or [])
 
-        self.conn.execute(
-            "INSERT INTO nodes (id, type, text, embedding, created_at, updated_at, source_ids) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (node_id, type, text, embedding_to_blob(embedding), now, now, source_ids_json),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "INSERT INTO nodes (id, type, text, embedding, created_at, updated_at, source_ids) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (node_id, type, text, embedding_to_blob(embedding), now, now, source_ids_json),
+            )
+            conn.commit()
         self._append_to_cache(node_id, embedding)
         return node_id
 
     def get_node(self, node_id: str) -> dict | None:
         """Fetch a single node by ID."""
-        row = self.conn.execute(
-            "SELECT id, type, text, embedding, created_at, updated_at, source_ids "
-            "FROM nodes WHERE id = ?",
-            (node_id,),
-        ).fetchone()
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT id, type, text, embedding, created_at, updated_at, source_ids "
+                "FROM nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
         if not row:
             return None
         return {
@@ -267,21 +288,23 @@ class GraphStore:
     def update_node_embedding(self, node_id: str, embedding: np.ndarray):
         """Replace a node's embedding (for dream reconsolidation)."""
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "UPDATE nodes SET embedding = ?, updated_at = ? WHERE id = ?",
-            (embedding_to_blob(embedding), now, node_id),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE nodes SET embedding = ?, updated_at = ? WHERE id = ?",
+                (embedding_to_blob(embedding), now, node_id),
+            )
+            conn.commit()
         self._update_cache_embedding(node_id, embedding)
 
     def update_node_text(self, node_id: str, text: str, embedding: np.ndarray):
         """Replace a node's text and embedding (when re-synthesized)."""
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "UPDATE nodes SET text = ?, embedding = ?, updated_at = ? WHERE id = ?",
-            (text, embedding_to_blob(embedding), now, node_id),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE nodes SET text = ?, embedding = ?, updated_at = ? WHERE id = ?",
+                (text, embedding_to_blob(embedding), now, node_id),
+            )
+            conn.commit()
         self._update_cache_embedding(node_id, embedding)
 
     def merge_node_embedding(self, node_id: str, new_embedding: np.ndarray,
@@ -301,11 +324,12 @@ class GraphStore:
         merged_sources = existing_sources + (new_source_ids or [])
         now = datetime.now(timezone.utc).isoformat()
 
-        self.conn.execute(
-            "UPDATE nodes SET embedding = ?, source_ids = ?, updated_at = ? WHERE id = ?",
-            (embedding_to_blob(blended), json.dumps(merged_sources), now, node_id),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE nodes SET embedding = ?, source_ids = ?, updated_at = ? WHERE id = ?",
+                (embedding_to_blob(blended), json.dumps(merged_sources), now, node_id),
+            )
+            conn.commit()
         self._update_cache_embedding(node_id, blended)
 
     def find_similar(self, embedding: np.ndarray, threshold: float = 0.85,
@@ -330,9 +354,10 @@ class GraphStore:
 
         # Optional type filter
         if node_type:
-            row = self.conn.execute(
-                "SELECT type FROM nodes WHERE id = ?", (best_id,)
-            ).fetchone()
+            with self._db() as conn:
+                row = conn.execute(
+                    "SELECT type FROM nodes WHERE id = ?", (best_id,)
+                ).fetchone()
             if not row or row[0] != node_type:
                 # Find next best matching the type
                 sorted_indices = np.argsort(-similarities)
@@ -340,9 +365,10 @@ class GraphStore:
                     if float(similarities[idx]) < threshold:
                         return None
                     nid = self._node_ids[int(idx)]
-                    row = self.conn.execute(
-                        "SELECT type FROM nodes WHERE id = ?", (nid,)
-                    ).fetchone()
+                    with self._db() as conn:
+                        row = conn.execute(
+                            "SELECT type FROM nodes WHERE id = ?", (nid,)
+                        ).fetchone()
                     if row and row[0] == node_type:
                         best_id = nid
                         best_sim = float(similarities[int(idx)])
@@ -364,20 +390,22 @@ class GraphStore:
         if source_id == target_id:
             return
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "INSERT OR IGNORE INTO edges (source_id, target_id, weight, created_at, activation_count) "
-            "VALUES (?, ?, ?, ?, 0)",
-            (source_id, target_id, weight, now),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, weight, created_at, activation_count) "
+                "VALUES (?, ?, ?, ?, 0)",
+                (source_id, target_id, weight, now),
+            )
+            conn.commit()
 
     def get_edges(self, node_id: str) -> list[dict]:
         """Get all edges connected to a node (both directions)."""
-        rows = self.conn.execute(
-            "SELECT source_id, target_id, weight, created_at, last_activated, activation_count "
-            "FROM edges WHERE source_id = ? OR target_id = ?",
-            (node_id, node_id),
-        ).fetchall()
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT source_id, target_id, weight, created_at, last_activated, activation_count "
+                "FROM edges WHERE source_id = ? OR target_id = ?",
+                (node_id, node_id),
+            ).fetchall()
         return [
             {
                 "source_id": r[0],
@@ -393,19 +421,21 @@ class GraphStore:
     def bump_edge_activation(self, source_id: str, target_id: str):
         """Increment activation count and update timestamp for a single edge."""
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "UPDATE edges SET activation_count = activation_count + 1, "
-            "last_activated = ? WHERE source_id = ? AND target_id = ?",
-            (now, source_id, target_id),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE edges SET activation_count = activation_count + 1, "
+                "last_activated = ? WHERE source_id = ? AND target_id = ?",
+                (now, source_id, target_id),
+            )
+            conn.commit()
 
     def get_activated_edges(self) -> list[dict]:
         """Get all edges with activation_count > 0 (for dream processing)."""
-        rows = self.conn.execute(
-            "SELECT source_id, target_id, weight, created_at, last_activated, activation_count "
-            "FROM edges WHERE activation_count > 0"
-        ).fetchall()
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT source_id, target_id, weight, created_at, last_activated, activation_count "
+                "FROM edges WHERE activation_count > 0"
+            ).fetchall()
         return [
             {
                 "source_id": r[0],
@@ -420,19 +450,21 @@ class GraphStore:
 
     def reset_activation_counts(self):
         """Zero out all activation counts (called after dream processing)."""
-        self.conn.execute(
-            "UPDATE edges SET activation_count = 0 WHERE activation_count > 0"
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE edges SET activation_count = 0 WHERE activation_count > 0"
+            )
+            conn.commit()
 
     def update_edge_weight(self, source_id: str, target_id: str, weight: float):
         """Set edge weight, clamped to [0, 1]."""
         weight = max(0.0, min(1.0, weight))
-        self.conn.execute(
-            "UPDATE edges SET weight = ? WHERE source_id = ? AND target_id = ?",
-            (weight, source_id, target_id),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE edges SET weight = ? WHERE source_id = ? AND target_id = ?",
+                (weight, source_id, target_id),
+            )
+            conn.commit()
 
     # ------------------------------------------------------------------
     # Search
@@ -509,15 +541,16 @@ class GraphStore:
 
         # Hydrate with node text and type
         hydrated = []
-        for r in sorted_results:
-            row = self.conn.execute(
-                "SELECT type, text, source_ids FROM nodes WHERE id = ?", (r["id"],)
-            ).fetchone()
-            if row:
-                r["type"] = row[0]
-                r["text"] = row[1]
-                r["source_ids"] = json.loads(row[2]) if row[2] else []
-                hydrated.append(r)
+        with self._db() as conn:
+            for r in sorted_results:
+                row = conn.execute(
+                    "SELECT type, text, source_ids FROM nodes WHERE id = ?", (r["id"],)
+                ).fetchone()
+                if row:
+                    r["type"] = row[0]
+                    r["text"] = row[1]
+                    r["source_ids"] = json.loads(row[2]) if row[2] else []
+                    hydrated.append(r)
 
         return hydrated
 
@@ -535,23 +568,24 @@ class GraphStore:
         recall_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
-        self.conn.execute(
-            "INSERT INTO recalls "
-            "(id, query_embedding, created_at, session_id, query_text, "
-            " general_surprisal, personal_surprisal) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (recall_id, embedding_to_blob(query_embedding), now, session_id,
-             query_text, general_surprisal, personal_surprisal),
-        )
-        for i, r in enumerate(results):
-            self.conn.execute(
-                "INSERT INTO recall_results "
-                "(recall_id, position, node_id, similarity, source, connected_via) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (recall_id, i, r["id"], r.get("similarity", 0.0),
-                 r.get("source", "seed"), r.get("connected_via")),
+        with self._db() as conn:
+            conn.execute(
+                "INSERT INTO recalls "
+                "(id, query_embedding, created_at, session_id, query_text, "
+                " general_surprisal, personal_surprisal) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (recall_id, embedding_to_blob(query_embedding), now, session_id,
+                 query_text, general_surprisal, personal_surprisal),
             )
-        self.conn.commit()
+            for i, r in enumerate(results):
+                conn.execute(
+                    "INSERT INTO recall_results "
+                    "(recall_id, position, node_id, similarity, source, connected_via) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (recall_id, i, r["id"], r.get("similarity", 0.0),
+                     r.get("source", "seed"), r.get("connected_via")),
+                )
+            conn.commit()
         return recall_id
 
     def reflect_on_recall(self, recall_id: str, reflections: list[str]):
@@ -559,13 +593,14 @@ class GraphStore:
 
         reflections: list of single-char codes like ['U', 'I', 'N', 'N', 'M'].
         """
-        for i, code in enumerate(reflections):
-            self.conn.execute(
-                "UPDATE recall_results SET reflection = ? "
-                "WHERE recall_id = ? AND position = ?",
-                (code, recall_id, i),
-            )
-        self.conn.commit()
+        with self._db() as conn:
+            for i, code in enumerate(reflections):
+                conn.execute(
+                    "UPDATE recall_results SET reflection = ? "
+                    "WHERE recall_id = ? AND position = ?",
+                    (code, recall_id, i),
+                )
+            conn.commit()
 
     def get_reflected_recalls(self) -> list[dict]:
         """Return un-dreamed recalls that have at least one reflected result.
@@ -573,44 +608,45 @@ class GraphStore:
         Returns list of dicts with keys: recall_id, query_embedding, results.
         Each result has: node_id, similarity, source, connected_via, reflection.
         """
-        # Find recall IDs that have reflections and haven't been dreamed yet
-        reflected_ids = self.conn.execute(
-            "SELECT DISTINCT rr.recall_id FROM recall_results rr "
-            "JOIN recalls r ON r.id = rr.recall_id "
-            "WHERE rr.reflection IS NOT NULL AND r.dreamed_at IS NULL"
-        ).fetchall()
-        if not reflected_ids:
-            return []
-
-        recalls = []
-        for (recall_id,) in reflected_ids:
-            row = self.conn.execute(
-                "SELECT query_embedding FROM recalls WHERE id = ?",
-                (recall_id,),
-            ).fetchone()
-            if not row:
-                continue
-
-            results = self.conn.execute(
-                "SELECT node_id, similarity, source, connected_via, reflection "
-                "FROM recall_results WHERE recall_id = ? ORDER BY position",
-                (recall_id,),
+        with self._db() as conn:
+            # Find recall IDs that have reflections and haven't been dreamed yet
+            reflected_ids = conn.execute(
+                "SELECT DISTINCT rr.recall_id FROM recall_results rr "
+                "JOIN recalls r ON r.id = rr.recall_id "
+                "WHERE rr.reflection IS NOT NULL AND r.dreamed_at IS NULL"
             ).fetchall()
+            if not reflected_ids:
+                return []
 
-            recalls.append({
-                "recall_id": recall_id,
-                "query_embedding": blob_to_embedding(row[0]),
-                "results": [
-                    {
-                        "node_id": r[0],
-                        "similarity": r[1],
-                        "source": r[2],
-                        "connected_via": r[3],
-                        "reflection": r[4],
-                    }
-                    for r in results
-                ],
-            })
+            recalls = []
+            for (recall_id,) in reflected_ids:
+                row = conn.execute(
+                    "SELECT query_embedding FROM recalls WHERE id = ?",
+                    (recall_id,),
+                ).fetchone()
+                if not row:
+                    continue
+
+                results = conn.execute(
+                    "SELECT node_id, similarity, source, connected_via, reflection "
+                    "FROM recall_results WHERE recall_id = ? ORDER BY position",
+                    (recall_id,),
+                ).fetchall()
+
+                recalls.append({
+                    "recall_id": recall_id,
+                    "query_embedding": blob_to_embedding(row[0]),
+                    "results": [
+                        {
+                            "node_id": r[0],
+                            "similarity": r[1],
+                            "source": r[2],
+                            "connected_via": r[3],
+                            "reflection": r[4],
+                        }
+                        for r in results
+                    ],
+                })
 
         return recalls
 
@@ -622,71 +658,73 @@ class GraphStore:
         Returns list of dicts with keys: recall_id, created_at, session_id,
         results (each with node_id, type, text, similarity, source, reflection).
         """
-        if session_id:
-            rows = self.conn.execute(
-                "SELECT id, created_at, session_id, query_text, "
-                "general_surprisal, personal_surprisal FROM recalls "
-                "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-                (session_id, limit),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT id, created_at, session_id, query_text, "
-                "general_surprisal, personal_surprisal FROM recalls "
-                "ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+        with self._db() as conn:
+            if session_id:
+                rows = conn.execute(
+                    "SELECT id, created_at, session_id, query_text, "
+                    "general_surprisal, personal_surprisal FROM recalls "
+                    "WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (session_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, created_at, session_id, query_text, "
+                    "general_surprisal, personal_surprisal FROM recalls "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
 
-        recalls = []
-        for recall_id, created_at, sess_id, query_text, gen_s, pers_s in rows:
-            results = self.conn.execute(
-                "SELECT rr.node_id, rr.similarity, rr.source, "
-                "rr.connected_via, rr.reflection, n.type, n.text "
-                "FROM recall_results rr "
-                "LEFT JOIN nodes n ON rr.node_id = n.id "
-                "WHERE rr.recall_id = ? ORDER BY rr.position",
-                (recall_id,),
-            ).fetchall()
+            recalls = []
+            for recall_id, created_at, sess_id, query_text, gen_s, pers_s in rows:
+                results = conn.execute(
+                    "SELECT rr.node_id, rr.similarity, rr.source, "
+                    "rr.connected_via, rr.reflection, n.type, n.text "
+                    "FROM recall_results rr "
+                    "LEFT JOIN nodes n ON rr.node_id = n.id "
+                    "WHERE rr.recall_id = ? ORDER BY rr.position",
+                    (recall_id,),
+                ).fetchall()
 
-            recalls.append({
-                "recall_id": recall_id,
-                "created_at": created_at,
-                "session_id": sess_id,
-                "query_text": query_text,
-                "general_surprisal": gen_s,
-                "personal_surprisal": pers_s,
-                "results": [
-                    {
-                        "node_id": r[0],
-                        "similarity": r[1],
-                        "source": r[2],
-                        "connected_via": r[3],
-                        "reflection": r[4],
-                        "type": r[5],
-                        "text": r[6],
-                    }
-                    for r in results
-                ],
-            })
+                recalls.append({
+                    "recall_id": recall_id,
+                    "created_at": created_at,
+                    "session_id": sess_id,
+                    "query_text": query_text,
+                    "general_surprisal": gen_s,
+                    "personal_surprisal": pers_s,
+                    "results": [
+                        {
+                            "node_id": r[0],
+                            "similarity": r[1],
+                            "source": r[2],
+                            "connected_via": r[3],
+                            "reflection": r[4],
+                            "type": r[5],
+                            "text": r[6],
+                        }
+                        for r in results
+                    ],
+                })
 
         return recalls
 
     def clear_reflected_recalls(self):
         """Mark reflected recalls as dreamed."""
         now = datetime.now(timezone.utc).isoformat()
-        reflected_ids = self.conn.execute(
-            "SELECT DISTINCT recall_id FROM recall_results WHERE reflection IS NOT NULL"
-        ).fetchall()
-        if not reflected_ids:
-            return
+        with self._db() as conn:
+            reflected_ids = conn.execute(
+                "SELECT DISTINCT recall_id FROM recall_results WHERE reflection IS NOT NULL"
+            ).fetchall()
+            if not reflected_ids:
+                return
 
-        ids = [r[0] for r in reflected_ids]
-        placeholders = ",".join("?" * len(ids))
-        self.conn.execute(
-            f"UPDATE recalls SET dreamed_at = ? WHERE id IN ({placeholders})",
-            [now] + ids,
-        )
-        self.conn.commit()
+            ids = [r[0] for r in reflected_ids]
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(
+                f"UPDATE recalls SET dreamed_at = ? WHERE id IN ({placeholders})",
+                [now] + ids,
+            )
+            conn.commit()
 
     def get_recalled_nodes_for_sessions(self, session_ids: list[str]) -> list[dict]:
         """Fetch unique nodes that were recalled during the given sessions.
@@ -698,25 +736,27 @@ class GraphStore:
             return []
 
         placeholders = ",".join("?" * len(session_ids))
-        rows = self.conn.execute(
-            f"SELECT DISTINCT n.id, n.type, n.text "
-            f"FROM recalls r "
-            f"JOIN recall_results rr ON r.id = rr.recall_id "
-            f"JOIN nodes n ON rr.node_id = n.id "
-            f"WHERE r.session_id IN ({placeholders})",
-            session_ids,
-        ).fetchall()
+        with self._db() as conn:
+            rows = conn.execute(
+                f"SELECT DISTINCT n.id, n.type, n.text "
+                f"FROM recalls r "
+                f"JOIN recall_results rr ON r.id = rr.recall_id "
+                f"JOIN nodes n ON rr.node_id = n.id "
+                f"WHERE r.session_id IN ({placeholders})",
+                session_ids,
+            ).fetchall()
 
         return [{"id": r[0], "type": r[1], "text": r[2]} for r in rows]
 
     def clear_processed_recalls(self):
         """Mark all recalls as dreamed instead of deleting them."""
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "UPDATE recalls SET dreamed_at = ? WHERE dreamed_at IS NULL",
-            (now,),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE recalls SET dreamed_at = ? WHERE dreamed_at IS NULL",
+                (now,),
+            )
+            conn.commit()
 
     # ------------------------------------------------------------------
     # Read-only queries (for browse UI)
@@ -725,24 +765,25 @@ class GraphStore:
     def list_nodes(self, node_type: str | None = None,
                    limit: int = 50, offset: int = 0) -> dict:
         """Paginated node listing without embedding blobs."""
-        if node_type:
-            total = self.conn.execute(
-                "SELECT COUNT(*) FROM nodes WHERE type = ?", (node_type,)
-            ).fetchone()[0]
-            rows = self.conn.execute(
-                "SELECT id, type, text, created_at, updated_at, source_ids "
-                "FROM nodes WHERE type = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (node_type, limit, offset),
-            ).fetchall()
-        else:
-            total = self.conn.execute(
-                "SELECT COUNT(*) FROM nodes"
-            ).fetchone()[0]
-            rows = self.conn.execute(
-                "SELECT id, type, text, created_at, updated_at, source_ids "
-                "FROM nodes ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
+        with self._db() as conn:
+            if node_type:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE type = ?", (node_type,)
+                ).fetchone()[0]
+                rows = conn.execute(
+                    "SELECT id, type, text, created_at, updated_at, source_ids "
+                    "FROM nodes WHERE type = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (node_type, limit, offset),
+                ).fetchall()
+            else:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM nodes"
+                ).fetchone()[0]
+                rows = conn.execute(
+                    "SELECT id, type, text, created_at, updated_at, source_ids "
+                    "FROM nodes ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
 
         return {
             "nodes": [
@@ -768,10 +809,11 @@ class GraphStore:
         """
         cache_path = cache_path or LAYOUT_CACHE_PATH
 
-        node_rows = self.conn.execute("SELECT id FROM nodes").fetchall()
-        edge_rows = self.conn.execute(
-            "SELECT source_id, target_id, weight FROM edges"
-        ).fetchall()
+        with self._db() as conn:
+            node_rows = conn.execute("SELECT id FROM nodes").fetchall()
+            edge_rows = conn.execute(
+                "SELECT source_id, target_id, weight FROM edges"
+            ).fetchall()
 
         if not node_rows:
             positions: dict[str, dict] = {}
@@ -857,16 +899,17 @@ class GraphStore:
     def get_full_graph(self, node_limit: int = 2000,
                        edge_limit: int = 5000) -> dict:
         """All nodes + edges for Cytoscape.js initial load (no embeddings)."""
-        node_rows = self.conn.execute(
-            "SELECT id, type, text, created_at, updated_at, source_ids "
-            "FROM nodes LIMIT ?",
-            (node_limit,),
-        ).fetchall()
-        edge_rows = self.conn.execute(
-            "SELECT source_id, target_id, weight, created_at, last_activated, activation_count "
-            "FROM edges LIMIT ?",
-            (edge_limit,),
-        ).fetchall()
+        with self._db() as conn:
+            node_rows = conn.execute(
+                "SELECT id, type, text, created_at, updated_at, source_ids "
+                "FROM nodes LIMIT ?",
+                (node_limit,),
+            ).fetchall()
+            edge_rows = conn.execute(
+                "SELECT source_id, target_id, weight, created_at, last_activated, activation_count "
+                "FROM edges LIMIT ?",
+                (edge_limit,),
+            ).fetchall()
 
         # Load cached layout positions
         layout_positions: dict[str, dict] = {}
@@ -904,10 +947,11 @@ class GraphStore:
 
     def reflection_distribution(self) -> dict:
         """Count of each reflection code across all recall results."""
-        rows = self.conn.execute(
-            "SELECT reflection, COUNT(*) FROM recall_results "
-            "WHERE reflection IS NOT NULL GROUP BY reflection"
-        ).fetchall()
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT reflection, COUNT(*) FROM recall_results "
+                "WHERE reflection IS NOT NULL GROUP BY reflection"
+            ).fetchall()
         return {row[0]: row[1] for row in rows}
 
     def reflection_timeline(self) -> list[dict]:
@@ -916,15 +960,16 @@ class GraphStore:
         Returns list of {bucket, U, I, N, D, M} sorted chronologically.
         Bucket is ISO timestamp truncated to the hour.
         """
-        rows = self.conn.execute(
-            "SELECT substr(r.created_at, 1, 13) AS bucket, "
-            "       rr.reflection, COUNT(*) "
-            "FROM recall_results rr "
-            "JOIN recalls r ON r.id = rr.recall_id "
-            "WHERE rr.reflection IS NOT NULL "
-            "GROUP BY bucket, rr.reflection "
-            "ORDER BY bucket"
-        ).fetchall()
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT substr(r.created_at, 1, 13) AS bucket, "
+                "       rr.reflection, COUNT(*) "
+                "FROM recall_results rr "
+                "JOIN recalls r ON r.id = rr.recall_id "
+                "WHERE rr.reflection IS NOT NULL "
+                "GROUP BY bucket, rr.reflection "
+                "ORDER BY bucket"
+            ).fetchall()
 
         buckets: dict[str, dict] = {}
         for bucket_str, reflection, count in rows:
@@ -947,18 +992,20 @@ class GraphStore:
 
         Replaces any existing data.
         """
-        self.conn.execute("DELETE FROM english_word_freqs")
-        self.conn.executemany(
-            "INSERT INTO english_word_freqs (word, log_prob) VALUES (?, ?)",
-            freqs.items(),
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.execute("DELETE FROM english_word_freqs")
+            conn.executemany(
+                "INSERT INTO english_word_freqs (word, log_prob) VALUES (?, ?)",
+                freqs.items(),
+            )
+            conn.commit()
 
     def get_english_log_prob(self, word: str) -> float | None:
         """Return log_prob for a single english word, or None if unseen."""
-        row = self.conn.execute(
-            "SELECT log_prob FROM english_word_freqs WHERE word = ?", (word,)
-        ).fetchone()
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT log_prob FROM english_word_freqs WHERE word = ?", (word,)
+            ).fetchone()
         return row[0] if row else None
 
     def get_english_log_probs(self, words: list[str]) -> dict[str, float]:
@@ -966,53 +1013,59 @@ class GraphStore:
         if not words:
             return {}
         placeholders = ",".join("?" for _ in words)
-        rows = self.conn.execute(
-            f"SELECT word, log_prob FROM english_word_freqs "
-            f"WHERE word IN ({placeholders})", words
-        ).fetchall()
+        with self._db() as conn:
+            rows = conn.execute(
+                f"SELECT word, log_prob FROM english_word_freqs "
+                f"WHERE word IN ({placeholders})", words
+            ).fetchall()
         return {r[0]: r[1] for r in rows}
 
     def english_freq_count(self) -> int:
         """Number of words in the english frequency table."""
-        row = self.conn.execute(
-            "SELECT COUNT(*) FROM english_word_freqs"
-        ).fetchone()
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM english_word_freqs"
+            ).fetchone()
         return row[0]
 
     def update_personal_word_counts(self, words: list[str]):
         """Increment counts for each word in the personal corpus."""
         if not words:
             return
-        self.conn.executemany(
-            "INSERT INTO personal_word_counts (word, count) VALUES (?, 1) "
-            "ON CONFLICT(word) DO UPDATE SET count = count + 1",
-            [(w,) for w in words],
-        )
-        self.conn.commit()
+        with self._db() as conn:
+            conn.executemany(
+                "INSERT INTO personal_word_counts (word, count) VALUES (?, 1) "
+                "ON CONFLICT(word) DO UPDATE SET count = count + 1",
+                [(w,) for w in words],
+            )
+            conn.commit()
 
     def get_personal_word_counts(self, words: list[str]) -> dict[str, int]:
         """Return {word: count} for words found in the personal table."""
         if not words:
             return {}
         placeholders = ",".join("?" for _ in words)
-        rows = self.conn.execute(
-            f"SELECT word, count FROM personal_word_counts "
-            f"WHERE word IN ({placeholders})", words
-        ).fetchall()
+        with self._db() as conn:
+            rows = conn.execute(
+                f"SELECT word, count FROM personal_word_counts "
+                f"WHERE word IN ({placeholders})", words
+            ).fetchall()
         return {r[0]: r[1] for r in rows}
 
     def personal_corpus_total(self) -> int:
         """Total word count across all personal entries."""
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(count), 0) FROM personal_word_counts"
-        ).fetchone()
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(count), 0) FROM personal_word_counts"
+            ).fetchone()
         return row[0]
 
     def personal_vocab_size(self) -> int:
         """Number of distinct words in the personal corpus."""
-        row = self.conn.execute(
-            "SELECT COUNT(*) FROM personal_word_counts"
-        ).fetchone()
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM personal_word_counts"
+            ).fetchone()
         return row[0]
 
     # ------------------------------------------------------------------
@@ -1021,15 +1074,16 @@ class GraphStore:
 
     def stats(self) -> dict:
         """Return node and edge counts by type."""
-        node_counts = {}
-        for row in self.conn.execute("SELECT type, COUNT(*) FROM nodes GROUP BY type"):
-            node_counts[row[0]] = row[1]
+        with self._db() as conn:
+            node_counts = {}
+            for row in conn.execute("SELECT type, COUNT(*) FROM nodes GROUP BY type"):
+                node_counts[row[0]] = row[1]
 
-        total_nodes = sum(node_counts.values())
-        total_edges = self.conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-        activated_edges = self.conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE activation_count > 0"
-        ).fetchone()[0]
+            total_nodes = sum(node_counts.values())
+            total_edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+            activated_edges = conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE activation_count > 0"
+            ).fetchone()[0]
 
         return {
             "total_nodes": total_nodes,
@@ -1040,32 +1094,35 @@ class GraphStore:
 
     def pending_dream_count(self) -> int:
         """Count of reflected recalls that haven't been dreamed yet."""
-        row = self.conn.execute(
-            "SELECT COUNT(DISTINCT rr.recall_id) FROM recall_results rr "
-            "JOIN recalls r ON r.id = rr.recall_id "
-            "WHERE rr.reflection IS NOT NULL AND r.dreamed_at IS NULL"
-        ).fetchone()
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT rr.recall_id) FROM recall_results rr "
+                "JOIN recalls r ON r.id = rr.recall_id "
+                "WHERE rr.reflection IS NOT NULL AND r.dreamed_at IS NULL"
+            ).fetchone()
         return row[0]
 
     def close(self):
-        self.conn.close()
+        with self._db() as conn:
+            conn.close()
 
 
 class DreamLog:
     """Append-only dream log backed by the same sqlite DB as GraphStore."""
 
     def __init__(self, graph_store: GraphStore):
-        self.conn = graph_store.conn
+        self._graph_store = graph_store
 
     def start_run(self, run_type: str) -> str:
         """Insert a dream_runs row and return the run UUID."""
         run_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "INSERT INTO dream_runs (id, type, started_at) VALUES (?, ?, ?)",
-            (run_id, run_type, now),
-        )
-        self.conn.commit()
+        with self._graph_store._db() as conn:
+            conn.execute(
+                "INSERT INTO dream_runs (id, type, started_at) VALUES (?, ?, ?)",
+                (run_id, run_type, now),
+            )
+            conn.commit()
         return run_id
 
     def log_operation(self, run_id: str, operation: str,
@@ -1073,13 +1130,14 @@ class DreamLog:
                       detail: dict):
         """Insert a dream_operations row."""
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "INSERT INTO dream_operations "
-            "(run_id, timestamp, operation, node_id, node_type, detail) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (run_id, now, operation, node_id, node_type, json.dumps(detail)),
-        )
-        self.conn.commit()
+        with self._graph_store._db() as conn:
+            conn.execute(
+                "INSERT INTO dream_operations "
+                "(run_id, timestamp, operation, node_id, node_type, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, now, operation, node_id, node_type, json.dumps(detail)),
+            )
+            conn.commit()
 
     def finish_run(self, run_id: str, *, error: str | None = None,
                    chunks_processed: int = 0, nodes_created: int = 0,
@@ -1087,25 +1145,27 @@ class DreamLog:
                    edges_adjusted: int = 0, nodes_resynthesized: int = 0):
         """Update a dream_runs row with final counts and finished_at."""
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "UPDATE dream_runs SET finished_at = ?, error = ?, "
-            "chunks_processed = ?, nodes_created = ?, nodes_merged = ?, "
-            "edges_created = ?, edges_adjusted = ?, nodes_resynthesized = ? "
-            "WHERE id = ?",
-            (now, error, chunks_processed, nodes_created, nodes_merged,
-             edges_created, edges_adjusted, nodes_resynthesized, run_id),
-        )
-        self.conn.commit()
+        with self._graph_store._db() as conn:
+            conn.execute(
+                "UPDATE dream_runs SET finished_at = ?, error = ?, "
+                "chunks_processed = ?, nodes_created = ?, nodes_merged = ?, "
+                "edges_created = ?, edges_adjusted = ?, nodes_resynthesized = ? "
+                "WHERE id = ?",
+                (now, error, chunks_processed, nodes_created, nodes_merged,
+                 edges_created, edges_adjusted, nodes_resynthesized, run_id),
+            )
+            conn.commit()
 
     def list_runs(self, limit: int = 20) -> list[dict]:
         """Return recent dream runs, newest first."""
-        rows = self.conn.execute(
-            "SELECT id, type, started_at, finished_at, chunks_processed, "
-            "nodes_created, nodes_merged, edges_created, edges_adjusted, "
-            "nodes_resynthesized, error "
-            "FROM dream_runs ORDER BY started_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._graph_store._db() as conn:
+            rows = conn.execute(
+                "SELECT id, type, started_at, finished_at, chunks_processed, "
+                "nodes_created, nodes_merged, edges_created, edges_adjusted, "
+                "nodes_resynthesized, error "
+                "FROM dream_runs ORDER BY started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [
             {
                 "id": r[0],
@@ -1125,11 +1185,12 @@ class DreamLog:
 
     def get_run_operations(self, run_id: str) -> list[dict]:
         """Return all operations for a given run."""
-        rows = self.conn.execute(
-            "SELECT id, run_id, timestamp, operation, node_id, node_type, detail "
-            "FROM dream_operations WHERE run_id = ? ORDER BY id",
-            (run_id,),
-        ).fetchall()
+        with self._graph_store._db() as conn:
+            rows = conn.execute(
+                "SELECT id, run_id, timestamp, operation, node_id, node_type, detail "
+                "FROM dream_operations WHERE run_id = ? ORDER BY id",
+                (run_id,),
+            ).fetchall()
         return [
             {
                 "id": r[0],
