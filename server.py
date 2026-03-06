@@ -129,8 +129,12 @@ def make_subchunks(text: str, window: int = SUBCHUNK_WINDOW, overlap: int = SUBC
     return chunks
 
 
-def process_one_file(path: Path):
-    """Embed a queued chunk file and store it in ChromaDB. Deletes the file on success."""
+def _embed_one_file(path: Path) -> dict:
+    """Read a queued chunk file and compute embeddings. Returns data for ChromaDB upsert.
+
+    This runs in a thread pool — it does CPU-heavy embedding but does NOT
+    touch ChromaDB, keeping all ChromaDB access on the event loop thread.
+    """
     with open(path) as f:
         item = json.load(f)
 
@@ -150,14 +154,17 @@ def process_one_file(path: Path):
         "chunk_type": chunk_type,
         "dreamed": 0,
     }
-    collection.upsert(
-        ids=[doc_id],
-        embeddings=embedding,
-        documents=[text],
-        metadatas=[metadata],
-    )
 
-    # Generate and store subchunks
+    result = {
+        "doc_id": doc_id,
+        "text": text,
+        "embedding": embedding,
+        "metadata": metadata,
+        "session_id": session_id,
+        "turn_number": turn_number,
+    }
+
+    # Compute subchunk embeddings
     windows = make_subchunks(text)
     if windows:
         sc_ids = []
@@ -176,29 +183,28 @@ def process_one_file(path: Path):
                 "parent_chunk_id": doc_id,
                 "window_index": i,
             })
-        # Batch embed all subchunks at once
         sc_embeddings = model.encode(
             [DOCUMENT_PREFIX + t for t in sc_documents],
             show_progress_bar=False,
         ).tolist()
-        subchunk_collection.upsert(
-            ids=sc_ids,
-            embeddings=sc_embeddings,
-            documents=sc_documents,
-            metadatas=sc_metadatas,
-        )
+        result["subchunks"] = {
+            "ids": sc_ids,
+            "embeddings": sc_embeddings,
+            "documents": sc_documents,
+            "metadatas": sc_metadatas,
+        }
 
-    # Store user input separately for prompt-to-prompt matching
+    # Compute user input embedding
     user_text = item.get("user_text", "")
     if user_text:
         ui_embedding = model.encode(
             [DOCUMENT_PREFIX + user_text], show_progress_bar=False
         ).tolist()
-        user_input_collection.upsert(
-            ids=[f"{doc_id}_ui"],
-            embeddings=ui_embedding,
-            documents=[user_text],
-            metadatas=[{
+        result["user_input"] = {
+            "id": f"{doc_id}_ui",
+            "embedding": ui_embedding,
+            "text": user_text,
+            "metadata": {
                 "session_id": session_id,
                 "timestamp": metadata["timestamp"],
                 "project": metadata["project"],
@@ -206,11 +212,44 @@ def process_one_file(path: Path):
                 "branch": metadata["branch"],
                 "chunk_type": "user_input",
                 "parent_chunk_id": doc_id,
-            }],
+            },
+        }
+        result["user_words"] = tokenize(user_text)
+
+    return result
+
+
+def _store_one_file(data: dict, path: Path):
+    """Upsert pre-computed embeddings into ChromaDB. Runs on the event loop thread.
+
+    ChromaDB is not thread-safe — all access must be serialized on the same thread.
+    """
+    collection.upsert(
+        ids=[data["doc_id"]],
+        embeddings=data["embedding"],
+        documents=[data["text"]],
+        metadatas=[data["metadata"]],
+    )
+
+    if "subchunks" in data:
+        sc = data["subchunks"]
+        subchunk_collection.upsert(
+            ids=sc["ids"],
+            embeddings=sc["embeddings"],
+            documents=sc["documents"],
+            metadatas=sc["metadatas"],
         )
 
-        # Update personal word frequency counts for surprisal gate
-        words = tokenize(user_text)
+    if "user_input" in data:
+        ui = data["user_input"]
+        user_input_collection.upsert(
+            ids=[ui["id"]],
+            embeddings=ui["embedding"],
+            documents=[ui["text"]],
+            metadatas=[ui["metadata"]],
+        )
+
+        words = data.get("user_words", [])
         if words and graph_store:
             graph_store.update_personal_word_counts(words)
 
@@ -218,9 +257,15 @@ def process_one_file(path: Path):
 
 
 async def queue_worker():
-    """Background loop that processes the incoming queue."""
+    """Background loop that processes the incoming queue.
+
+    Embedding (CPU-heavy) runs in a thread pool. ChromaDB upserts run on the
+    event loop thread so that all ChromaDB access is single-threaded — ChromaDB's
+    PersistentClient is not thread-safe.
+    """
     incoming = Path(INCOMING_DIR)
     processed_total = 0
+    loop = asyncio.get_event_loop()
     while True:
         try:
             files = sorted(incoming.glob("*.json"))
@@ -228,8 +273,10 @@ async def queue_worker():
                 print(f"Queue: {len(files)} pending")
             for i, path in enumerate(files):
                 try:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, process_one_file, path)
+                    # Embed in thread pool (CPU-heavy)
+                    data = await loop.run_in_executor(None, _embed_one_file, path)
+                    # Store in ChromaDB on event loop thread (not thread-safe)
+                    _store_one_file(data, path)
                     processed_total += 1
                     remaining = len(files) - i - 1
                     if processed_total % 50 == 0:
