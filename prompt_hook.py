@@ -39,7 +39,7 @@ def check_surprisal(text: str) -> dict | None:
 
 
 def search_graph(query: str, k: int = 5, session_id: str = "",
-                  min_similarity: float = 0.5,
+                  min_similarity: float = 0.65,
                   general_surprisal: float | None = None,
                   personal_surprisal: float | None = None) -> dict:
     """Search the graph memory layer for synthesized long-term memories.
