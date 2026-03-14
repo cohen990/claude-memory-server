@@ -145,6 +145,12 @@ class GraphStore:
                 FOREIGN KEY (node_id) REFERENCES nodes(id)
             );
 
+            CREATE TABLE IF NOT EXISTS markers (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                label TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS english_word_freqs (
                 word TEXT PRIMARY KEY,
                 log_prob REAL NOT NULL
@@ -1160,6 +1166,30 @@ class GraphStore:
                 buckets[bucket_str][reflection] = count
 
         return list(buckets.values())
+
+    # ------------------------------------------------------------------
+    # Markers (deploy / change annotations for charts)
+    # ------------------------------------------------------------------
+
+    def create_marker(self, label: str) -> dict:
+        """Create a timestamp marker with a label."""
+        marker_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as conn:
+            conn.execute(
+                "INSERT INTO markers (id, created_at, label) VALUES (?, ?, ?)",
+                (marker_id, now, label),
+            )
+            conn.commit()
+        return {"id": marker_id, "created_at": now, "label": label}
+
+    def list_markers(self) -> list[dict]:
+        """Return all markers, sorted chronologically."""
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT id, created_at, label FROM markers ORDER BY created_at"
+            ).fetchall()
+        return [{"id": r[0], "created_at": r[1], "label": r[2]} for r in rows]
 
     # ------------------------------------------------------------------
     # Word frequency tables (for surprisal gate)

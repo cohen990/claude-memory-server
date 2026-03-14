@@ -1398,3 +1398,31 @@ def test_reflect_on_node_not_found(store):
 
     found = store.reflect_on_node(recall_id, "deadbeef", "M")
     assert found is False
+
+
+# ---------------------------------------------------------------------------
+# Markers
+# ---------------------------------------------------------------------------
+
+def test_create_marker(store):
+    """create_marker returns marker with id, timestamp, and label."""
+    m = store.create_marker("min_sim 0.65")
+    assert m["id"]
+    assert m["created_at"]
+    assert m["label"] == "min_sim 0.65"
+
+
+def test_list_markers_empty(store):
+    """list_markers returns empty list when no markers exist."""
+    assert store.list_markers() == []
+
+
+def test_list_markers_ordered(store):
+    """list_markers returns markers in chronological order."""
+    store.create_marker("first")
+    store.create_marker("second")
+    markers = store.list_markers()
+    assert len(markers) == 2
+    assert markers[0]["label"] == "first"
+    assert markers[1]["label"] == "second"
+    assert markers[0]["created_at"] <= markers[1]["created_at"]

@@ -1,8 +1,8 @@
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
-  ResponsiveContainer,
+  ReferenceLine, ResponsiveContainer,
 } from 'recharts'
-import type { TimelineBucket } from '../../types'
+import type { TimelineBucket, Marker } from '../../types'
 
 const CODES = ['U', 'I', 'N', 'D', 'M'] as const
 const COLORS: Record<string, string> = {
@@ -25,11 +25,16 @@ function formatTick(iso: string): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2, '0')}:00`
 }
 
-interface Props {
-  data: TimelineBucket[]
+function snapToHour(iso: string): string {
+  return iso.slice(0, 13) + ':00:00'
 }
 
-export default function ReflectionLineChart({ data }: Props) {
+interface Props {
+  data: TimelineBucket[]
+  markers?: Marker[]
+}
+
+export default function ReflectionLineChart({ data, markers }: Props) {
   if (!data.length) return null
 
   return (
@@ -60,6 +65,16 @@ export default function ReflectionLineChart({ data }: Props) {
             formatter={(value: string) => LABELS[value] || value}
             wrapperStyle={{ fontSize: 10 }}
           />
+          {markers?.map(m => (
+            <ReferenceLine
+              key={m.id}
+              x={snapToHour(m.created_at)}
+              stroke="#ffffff"
+              strokeDasharray="4 3"
+              strokeOpacity={0.6}
+              label={{ value: m.label, position: 'top', fill: '#ffffff', fontSize: 9 }}
+            />
+          ))}
           {CODES.map(code => (
             <Line
               key={code}

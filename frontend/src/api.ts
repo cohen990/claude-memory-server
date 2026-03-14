@@ -5,6 +5,7 @@ import type {
   RecallsResponse,
   StatsResponse,
   TimelineBucket,
+  Marker,
   DreamRun,
   DreamOperation,
 } from './types'
@@ -44,6 +45,10 @@ export function fetchStats(): Promise<StatsResponse> {
 
 export function fetchReflectionTimeline(): Promise<TimelineBucket[]> {
   return get('/api/reflection-timeline')
+}
+
+export function fetchMarkers(): Promise<Marker[]> {
+  return get('/api/markers')
 }
 
 export function fetchDreamRuns(limit?: number): Promise<{ runs: DreamRun[] }> {

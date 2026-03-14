@@ -92,6 +92,12 @@ export interface TimelineBucket {
   M: number
 }
 
+export interface Marker {
+  id: string
+  created_at: string
+  label: string
+}
+
 export interface DreamRun {
   id: string
   type: 'consolidate' | 'reconsolidate'

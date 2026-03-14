@@ -1016,6 +1016,22 @@ async def graph_reflection_timeline():
     return graph_store.reflection_timeline()
 
 
+class CreateMarkerRequest(BaseModel):
+    label: str
+
+
+@app.post("/graph/marker")
+async def create_marker(req: CreateMarkerRequest):
+    """Create a timestamp marker for chart annotations."""
+    return graph_store.create_marker(req.label)
+
+
+@app.get("/graph/markers")
+async def list_markers():
+    """List all markers."""
+    return graph_store.list_markers()
+
+
 @app.get("/graph/dream-runs")
 async def graph_dream_runs(
     limit: int = Query(20, ge=1, le=100),

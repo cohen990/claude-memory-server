@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
-import { fetchStats, fetchReflectionTimeline } from '../../api'
+import { fetchStats, fetchReflectionTimeline, fetchMarkers } from '../../api'
 import { usePolling } from '../../hooks/usePolling'
-import type { StatsResponse, TimelineBucket } from '../../types'
+import type { StatsResponse, TimelineBucket, Marker } from '../../types'
 import StatCard from './StatCard'
 import ReflectionLineChart from './ReflectionLineChart'
 import ReflectionStackedChart from './ReflectionStackedChart'
@@ -18,16 +18,19 @@ interface CardDef {
 export default function StatsTab() {
   const [stats, setStats] = useState<StatsResponse | null>(null)
   const [timeline, setTimeline] = useState<TimelineBucket[]>([])
+  const [markers, setMarkers] = useState<Marker[]>([])
   const [error, setError] = useState<string | null>(null)
 
   const loadAll = useCallback(async () => {
     try {
-      const [s, t] = await Promise.all([
+      const [s, t, m] = await Promise.all([
         fetchStats(),
         fetchReflectionTimeline(),
+        fetchMarkers(),
       ])
       setStats(s)
       setTimeline(t)
+      setMarkers(m)
       setError(null)
     } catch (err) {
       if (!stats) setError((err as Error).message)
@@ -84,8 +87,8 @@ export default function StatsTab() {
           <StatCard key={c.key} label={c.label} value={c.value} className={c.cls} />
         ))}
       </div>
-      <ReflectionLineChart data={timeline} />
-      <ReflectionStackedChart data={timeline} />
+      <ReflectionLineChart data={timeline} markers={markers} />
+      <ReflectionStackedChart data={timeline} markers={markers} />
     </div>
   )
 }

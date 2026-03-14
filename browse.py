@@ -65,6 +65,11 @@ async def reflection_timeline():
     return await _proxy("/graph/reflection-timeline")
 
 
+@app.get("/api/markers")
+async def markers():
+    return await _proxy("/graph/markers")
+
+
 @app.get("/api/dream-runs")
 async def dream_runs(request: Request):
     return await _proxy("/graph/dream-runs", dict(request.query_params))
