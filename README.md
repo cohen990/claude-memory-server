@@ -164,7 +164,15 @@ Binds to `0.0.0.0:8421`. Open `http://your-server:8421` to browse. Three tabs:
 
 - **Graph** — Cytoscape.js force-directed layout of all nodes and edges. Click a node to see its text, metadata, and neighbors.
 - **Recalls** — Recent memory injections with reflections. Filter by session ID.
-- **Stats** — Node/edge counts, reflection distribution, and ChromaDB collection sizes (proxied from the main server).
+- **Stats** — Node/edge counts, reflection distribution, and ChromaDB collection sizes (proxied from the main server). Reflection timeline charts support **markers** — dashed vertical annotations for tracking the impact of changes over time.
+
+Create a marker via the server API:
+
+```bash
+curl -X POST http://your-server:8420/graph/marker \
+  -H 'Content-Type: application/json' \
+  -d '{"label": "min_sim 0.65"}'
+```
 
 As a systemd service:
 

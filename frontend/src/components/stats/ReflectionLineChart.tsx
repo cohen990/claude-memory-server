@@ -29,6 +29,24 @@ function snapToHour(iso: string): string {
   return iso.slice(0, 13) + ':00:00'
 }
 
+function ensureMarkerBuckets(
+  data: TimelineBucket[],
+  markers: Marker[],
+): TimelineBucket[] {
+  if (!markers.length) return data
+  const existing = new Set(data.map(d => d.bucket))
+  const extras: TimelineBucket[] = []
+  for (const m of markers) {
+    const bucket = snapToHour(m.created_at)
+    if (!existing.has(bucket)) {
+      extras.push({ bucket, U: 0, I: 0, N: 0, D: 0, M: 0 })
+      existing.add(bucket)
+    }
+  }
+  if (!extras.length) return data
+  return [...data, ...extras].sort((a, b) => a.bucket.localeCompare(b.bucket))
+}
+
 interface Props {
   data: TimelineBucket[]
   markers?: Marker[]
@@ -37,11 +55,13 @@ interface Props {
 export default function ReflectionLineChart({ data, markers }: Props) {
   if (!data.length) return null
 
+  const chartData = ensureMarkerBuckets(data, markers ?? [])
+
   return (
     <div className="chart-container">
       <h4 className="chart-title">Reflection Timeline</h4>
       <ResponsiveContainer width="100%" height={240}>
-        <LineChart data={data}>
+        <LineChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2a35" />
           <XAxis
             dataKey="bucket"
@@ -72,7 +92,7 @@ export default function ReflectionLineChart({ data, markers }: Props) {
               stroke="#ffffff"
               strokeDasharray="4 3"
               strokeOpacity={0.6}
-              label={{ value: m.label, position: 'top', fill: '#ffffff', fontSize: 9 }}
+              label={{ value: m.label, position: 'insideTopRight', fill: '#ffffff', fontSize: 9 }}
             />
           ))}
           {CODES.map(code => (
