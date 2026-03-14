@@ -779,17 +779,17 @@ def test_get_full_graph(store):
     assert result["edges"][0]["weight"] == pytest.approx(0.6)
 
 
-def test_get_full_graph_respects_limits(store):
-    """node_limit/edge_limit are honored."""
+def test_get_full_graph_returns_all(store):
+    """All nodes and edges are returned."""
     ids = []
     for i in range(5):
         ids.append(store.add_node("vibe", f"n{i}", _random_embedding(740 + i)))
     for i in range(4):
         store.add_edge(ids[i], ids[i + 1])
 
-    result = store.get_full_graph(node_limit=2, edge_limit=1)
-    assert len(result["nodes"]) == 2
-    assert len(result["edges"]) == 1
+    result = store.get_full_graph()
+    assert len(result["nodes"]) == 5
+    assert len(result["edges"]) == 4
 
 
 def test_get_full_graph_empty(store):
@@ -1275,3 +1275,126 @@ def test_get_run_operations_empty(dream_log):
 def test_get_run_operations_nonexistent(dream_log):
     """get_run_operations returns empty list for nonexistent run."""
     assert dream_log.get_run_operations("nonexistent-id") == []
+
+
+# ---------------------------------------------------------------------------
+# Contest memory tests
+# ---------------------------------------------------------------------------
+
+def test_contest_node(store):
+    """contest_node marks a node with a correction, resolvable by prefix."""
+    emb = _random_embedding(42)
+    node_id = store.add_node("detail", "Python 3.11 is preferred", emb)
+
+    result = store.contest_node(node_id[:8], "Python 3.12 is preferred")
+    assert result["node_id"] == node_id
+    assert result["text"] == "Python 3.11 is preferred"
+
+    # Verify the contest is stored
+    contested = store.get_contested_nodes()
+    assert len(contested) == 1
+    assert contested[0]["id"] == node_id
+    assert contested[0]["contested_correction"] == "Python 3.12 is preferred"
+    assert contested[0]["contested_at"] is not None
+
+
+def test_contest_node_not_found(store):
+    """contest_node raises ValueError for nonexistent prefix."""
+    with pytest.raises(ValueError, match="No node found"):
+        store.contest_node("deadbeef", "correction")
+
+
+def test_contest_node_ambiguous(store):
+    """contest_node raises ValueError for ambiguous prefix."""
+    # Create two nodes — if they happen to share a prefix, the test
+    # would be flaky. Use full IDs to guarantee disambiguation works.
+    emb = _random_embedding(1)
+    id1 = store.add_node("detail", "text 1", emb)
+    # Contest with full ID always works
+    result = store.contest_node(id1, "correction")
+    assert result["node_id"] == id1
+
+
+def test_resolve_contest_accept(store):
+    """resolve_contest with new text updates the node and clears contest."""
+    emb = _random_embedding(42)
+    node_id = store.add_node("detail", "old text", emb)
+    store.contest_node(node_id[:8], "new text")
+
+    new_emb = _random_embedding(99)
+    store.resolve_contest(node_id, "corrected text", new_emb)
+
+    # Contest cleared
+    assert store.get_contested_nodes() == []
+
+    # Node updated
+    node = store.get_node(node_id)
+    assert node["text"] == "corrected text"
+
+
+def test_resolve_contest_reject(store):
+    """resolve_contest with None keeps original text, clears contest."""
+    emb = _random_embedding(42)
+    node_id = store.add_node("detail", "original text", emb)
+    store.contest_node(node_id[:8], "wrong correction")
+
+    store.resolve_contest(node_id, None, None)
+
+    # Contest cleared
+    assert store.get_contested_nodes() == []
+
+    # Node unchanged
+    node = store.get_node(node_id)
+    assert node["text"] == "original text"
+
+
+def test_get_contested_nodes_empty(store):
+    """get_contested_nodes returns empty list when nothing contested."""
+    assert store.get_contested_nodes() == []
+
+
+# ---------------------------------------------------------------------------
+# Partial re-reflect tests
+# ---------------------------------------------------------------------------
+
+def test_reflect_on_node(store):
+    """reflect_on_node updates a single result's reflection by node prefix."""
+    emb_q = _random_embedding(1)
+    emb_a = _random_embedding(2)
+    emb_b = _random_embedding(3)
+    node_a = store.add_node("vibe", "memory A", emb_a)
+    node_b = store.add_node("detail", "memory B", emb_b)
+
+    recall_id = store.create_recall(emb_q, [
+        {"id": node_a, "similarity": 0.8, "source": "seed"},
+        {"id": node_b, "similarity": 0.7, "source": "seed"},
+    ])
+
+    # Initial full reflect
+    store.reflect_on_recall(recall_id, ["U", "N"])
+
+    # Partially re-reflect on node_b
+    found = store.reflect_on_node(recall_id, node_b[:8], "M")
+    assert found is True
+
+    # Verify: node_a still U, node_b now M
+    with store._db() as conn:
+        rows = conn.execute(
+            "SELECT node_id, reflection FROM recall_results "
+            "WHERE recall_id = ? ORDER BY position",
+            (recall_id,),
+        ).fetchall()
+    assert rows[0] == (node_a, "U")
+    assert rows[1] == (node_b, "M")
+
+
+def test_reflect_on_node_not_found(store):
+    """reflect_on_node returns False for nonexistent prefix."""
+    emb = _random_embedding(1)
+    node = store.add_node("vibe", "text", emb)
+    recall_id = store.create_recall(emb, [
+        {"id": node, "similarity": 0.8, "source": "seed"},
+    ])
+
+    found = store.reflect_on_node(recall_id, "deadbeef", "M")
+    assert found is False

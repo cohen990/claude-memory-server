@@ -449,6 +449,11 @@ class SurprisalRequest(BaseModel):
     text: str
 
 
+class ContestNodeRequest(BaseModel):
+    node_id_prefix: str
+    correction: str
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -779,6 +784,37 @@ async def reflect_on_recall(req: ReflectOnRecallRequest):
     return {"status": "ok", "recall_id": req.recall_id, "reflected": len(codes)}
 
 
+@app.post("/reflect_on_node")
+async def reflect_on_node(req: dict):
+    """Update the reflection for a single node within a recall.
+
+    Body: {"recall_id": str, "node_id_prefix": str, "reflection": str}
+    """
+    recall_id = req.get("recall_id", "")
+    node_id_prefix = req.get("node_id_prefix", "")
+    reflection = req.get("reflection", "")
+
+    valid_codes = {"U", "I", "N", "D", "M"}
+    if reflection not in valid_codes:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Invalid reflection code: {reflection!r}. Valid: {valid_codes}"},
+        )
+
+    try:
+        found = graph_store.reflect_on_node(recall_id, node_id_prefix, reflection)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+    if not found:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No result matching prefix {node_id_prefix!r} in recall {recall_id}"},
+        )
+
+    return {"status": "ok", "recall_id": recall_id, "node_id_prefix": node_id_prefix}
+
+
 @app.post("/list_recalls")
 async def list_recalls(req: ListRecallsRequest):
     """List recent recalls with full details for the /memories skill."""
@@ -859,6 +895,23 @@ async def chunks_mark_dreamed(req: MarkDreamedRequest):
     return {"marked": len(req.ids)}
 
 
+@app.post("/chunks/by_ids")
+async def chunks_by_ids(req: dict):
+    """Fetch specific chunks by their IDs."""
+    ids = req.get("ids", [])
+    if not ids:
+        return {"chunks": []}
+    results = collection.get(ids=ids, include=["documents", "metadatas"])
+    chunks = []
+    for i, doc_id in enumerate(results["ids"]):
+        chunks.append({
+            "id": doc_id,
+            "text": results["documents"][i],
+            "metadata": results["metadatas"][i],
+        })
+    return {"chunks": chunks}
+
+
 @app.post("/graph/reload_cache")
 async def reload_graph_cache():
     """Rebuild the graph store's in-memory embedding cache."""
@@ -879,12 +932,9 @@ async def recompute_layout():
 # ---------------------------------------------------------------------------
 
 @app.get("/graph/full")
-async def graph_full(
-    node_limit: int = Query(2000, ge=1),
-    edge_limit: int = Query(5000, ge=1),
-):
+async def graph_full():
     """Full graph for Cytoscape.js initial load."""
-    return graph_store.get_full_graph(node_limit=node_limit, edge_limit=edge_limit)
+    return graph_store.get_full_graph()
 
 
 @app.get("/graph/nodes")
@@ -928,6 +978,21 @@ async def graph_get_neighbors(node_id: str):
             neighbors.append({"node": neighbor, "edge": edge})
 
     return {"neighbors": neighbors}
+
+
+@app.post("/graph/contest")
+async def contest_node(req: ContestNodeRequest):
+    """Mark a graph node as contested with a proposed correction."""
+    try:
+        result = graph_store.contest_node(req.node_id_prefix, req.correction)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return {
+        "status": "contested",
+        "node_id": result["node_id"],
+        "current_text": result["text"],
+        "correction": req.correction,
+    }
 
 
 @app.get("/graph/recalls")
@@ -1086,6 +1151,34 @@ async def stats():
         "graph_activated_edges": gs.get("activated_edges", 0),
         "pending_dream": pending_dream,
     }
+
+
+@app.get("/dream/health")
+async def dream_health():
+    """Lightweight dream health check for the prompt hook."""
+    from graph import DreamLog
+    dream_log = DreamLog(graph_store)
+    runs = dream_log.list_runs(limit=5)
+
+    stuck = [r for r in runs if r["finished_at"] is None]
+    # Check if the most recent consolidation failed (sort by finished_at
+    # since started_at can be misleading with concurrent/killed runs)
+    consolidations = [r for r in runs if r["type"] == "consolidate"
+                      and r["finished_at"]]
+    consolidations.sort(key=lambda r: r["finished_at"], reverse=True)
+    last_consolidation = consolidations[0] if consolidations else None
+
+    status = "ok"
+    message = None
+    if stuck:
+        status = "stuck"
+        oldest = min(r["started_at"] for r in stuck)
+        message = f"{len(stuck)} dream run(s) started but never finished (oldest: {oldest})"
+    elif last_consolidation and last_consolidation.get("error"):
+        status = "failing"
+        message = f"Last consolidation failed: {last_consolidation['error']}"
+
+    return {"status": status, "message": message}
 
 
 # ---------------------------------------------------------------------------

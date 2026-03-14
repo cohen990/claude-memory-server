@@ -325,10 +325,14 @@ REFLECTION_LABELS = {
 
 @mcp.tool()
 async def reflect(r: str):
-    """Reflect on memories from the most recent graph memory injection.
+    """Reflect on memories from a graph memory injection.
 
     Call this once per turn when graph memories are injected via the prompt hook.
     The prompt hook output includes a recall ID — pass it back with reflections.
+
+    Reflections are overwrite-based — you can re-reflect on a past recall ID to
+    correct a wrong reflection. Use list_recalls to find the recall ID, then call
+    this tool again with the corrected codes.
 
     Format: recall_id:U,I,N,N,M
     One letter per memory, in order. Codes: U=used, I=interesting, N=noise, D=distracting, M=misleading.
@@ -373,6 +377,117 @@ async def reflect(r: str):
     return TextContent(
         type="text", text="",
         annotations=Annotations(audience=["assistant"]),
+    )
+
+
+@mcp.tool()
+async def re_reflect(r: str):
+    """Correct the reflection on a single memory from a past recall.
+
+    Use this when you realize a previous reflection was wrong — e.g. a memory
+    you marked U actually turned out to be misleading (M), or one you marked N
+    was actually used (U).
+
+    Format: recall_id:node_id_prefix:CODE
+    The recall ID and node ID prefix are from the original injection.
+    Code is one of: U=used, I=interesting, N=noise, D=distracting, M=misleading.
+
+    Example: "8dd0c3bc-83ea:837de466-83e:M"
+
+    Args:
+        r: Compact string like "recall_id:node_prefix:CODE"
+    """
+    if MEMORY_DISABLED:
+        return "Memory is disabled (MEMORY_DISABLED=1)."
+
+    parts = r.split(":")
+    if len(parts) < 3:
+        return "Error: expected format recall_id:node_id_prefix:CODE"
+
+    # Recall IDs contain dashes, so rejoin all but last two parts
+    code = parts[-1].strip()
+    node_prefix = parts[-2].strip()
+    recall_id = ":".join(parts[:-2]).strip()
+
+    if not recall_id or not node_prefix or not code:
+        return "Error: expected format recall_id:node_id_prefix:CODE"
+
+    valid_codes = set(REFLECTION_LABELS.keys())
+    if code not in valid_codes:
+        return f"Error: invalid code {code!r}. Valid: U, I, N, D, M"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{SERVER_URL}/reflect_on_node",
+                json={"recall_id": recall_id, "node_id_prefix": node_prefix,
+                      "reflection": code},
+            )
+            resp.raise_for_status()
+    except httpx.ConnectError:
+        return f"Error: Cannot connect to memory server at {SERVER_URL}. Is it running?"
+    except httpx.HTTPStatusError as e:
+        return f"Error: {e.response.status_code}: {e.response.json().get('error', e.response.text)}"
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+
+    return TextContent(
+        type="text", text="",
+        annotations=Annotations(audience=["assistant"]),
+    )
+
+
+@mcp.tool()
+async def contest_memory(c: str) -> str:
+    """Contest a graph memory node that contains incorrect information.
+
+    Flags the node for correction by the dream consolidation pipeline.
+    The dream will adjudicate between the original text and your correction,
+    consulting source conversations if available, then either update the node
+    or dismiss the contest.
+
+    Format: node_id_prefix:correction text
+    The prefix must be at least 8 characters of the node ID (shown in recall injections).
+
+    Example: "a1b2c3d4:The user prefers Python 3.12, not 3.11"
+
+    Args:
+        c: Compact contest string like "node_id_prefix:correction text"
+    """
+    if MEMORY_DISABLED:
+        return "Memory is disabled (MEMORY_DISABLED=1)."
+    if ":" not in c:
+        return "Error: expected format node_id_prefix:correction text"
+
+    prefix, correction = c.split(":", 1)
+    prefix = prefix.strip()
+    correction = correction.strip()
+
+    if not prefix or not correction:
+        return "Error: expected format node_id_prefix:correction text"
+    if len(prefix) < 8:
+        return "Error: node ID prefix must be at least 8 characters"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{SERVER_URL}/graph/contest",
+                json={"node_id_prefix": prefix, "correction": correction},
+            )
+            resp.raise_for_status()
+    except httpx.ConnectError:
+        return f"Error: Cannot connect to memory server at {SERVER_URL}. Is it running?"
+    except httpx.HTTPStatusError as e:
+        return f"Error: {e.response.status_code}: {e.response.json().get('error', e.response.text)}"
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+
+    data = resp.json()
+    return (
+        f"Node {data['node_id'][:12]}... contested.\n"
+        f"Current: {data['current_text'][:150]}\n"
+        f"Correction: {data['correction'][:150]}\n"
+        f"Will be adjudicated during next dream reconsolidation."
     )
 
 

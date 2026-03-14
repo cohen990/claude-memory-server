@@ -150,19 +150,32 @@ def main():
     if not graph_results:
         return
 
+    # Check dream health — warn Claude if consolidation is broken
+    dream_warning = None
+    try:
+        with urllib.request.urlopen(f"{SERVER_URL}/dream/health", timeout=2) as resp:
+            health = json.loads(resp.read())
+            if health.get("status") != "ok":
+                dream_warning = health.get("message", "dream consolidation issue detected")
+    except Exception:
+        pass
+
     lines = ["--- AGENT MEMORY (not visible to user) ---"]
+    if dream_warning:
+        lines.append(f"⚠ DREAM HEALTH WARNING: {dream_warning}. Tell the user about this.")
+
     if current_session:
         lines.append(f"(current session: {current_session} — pass as exclude_session_id to avoid self-references)")
 
-    recall_tag = f" recall:{recall_id}" if recall_id else ""
-    lines.append(f"[graph]{recall_tag} | {len(graph_results)} synthesized memor{'ies' if len(graph_results) != 1 else 'y'}:")
+    recall_tag = f" [recall:{recall_id}]" if recall_id else ""
+    lines.append(f"[graph]{recall_tag} {len(graph_results)} synthesized memor{'ies' if len(graph_results) != 1 else 'y'}:")
     for r in graph_results:
         node_id = r.get("id", "?")
         ntype = r.get("type", "?")
         sim = r.get("similarity", 0)
         text = r.get("text", "")[:200]
         source_ids = r.get("source_ids", [])
-        lines.append(f"  {sim:.2f} | {node_id[:12]} | [{ntype}] {text}")
+        lines.append(f"  [{node_id[:12]}] {sim:.2f} [{ntype}] {text}")
         if source_ids:
             # Show first few source chunk IDs for traceability
             shown = source_ids[:3]
@@ -174,7 +187,7 @@ def main():
     lines.append("Use search_memory or search_memory_detail tools with session_id to retrieve full source conversations.")
     if recall_id:
         example_codes = ",".join(["U"] + ["N"] * (len(graph_results) - 1)) if graph_results else "U"
-        lines.append(f"Reflect on these memories using the reflect tool: {recall_id}:{example_codes} (one code per memory above, in order)")
+        lines.append(f"Reflect: {recall_id}:{example_codes} (one code per memory, in order). To correct a single memory later: re_reflect recall_id:node_id:CODE")
     lines.append("--- END AGENT MEMORY ---")
     print("\n".join(lines))
 

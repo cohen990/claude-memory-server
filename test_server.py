@@ -404,3 +404,60 @@ def test_delete_by_session(client):
         "session_id": "session-aaa",
     })
     assert len(resp.json()["results"]) > 0
+
+
+def test_contest_node(client):
+    """Contest endpoint marks a node and returns its details."""
+    import numpy as np
+    import server as srv
+
+    emb = np.random.default_rng(42).standard_normal(768).astype(np.float32)
+    emb /= np.linalg.norm(emb)
+    node_id = srv.graph_store.add_node("detail", "Python 3.11 is preferred", emb)
+
+    resp = client.post("/graph/contest", json={
+        "node_id_prefix": node_id[:10],
+        "correction": "Python 3.12 is preferred",
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "contested"
+    assert data["node_id"] == node_id
+    assert data["current_text"] == "Python 3.11 is preferred"
+
+    # Clean up
+    srv.graph_store.resolve_contest(node_id, None, None)
+
+
+def test_contest_node_not_found(client):
+    """Contest endpoint returns 400 for nonexistent prefix."""
+    resp = client.post("/graph/contest", json={
+        "node_id_prefix": "deadbeef",
+        "correction": "some correction",
+    })
+    assert resp.status_code == 400
+    assert "No node found" in resp.json()["error"]
+
+
+def test_chunks_by_ids(client):
+    """chunks/by_ids returns requested chunks."""
+    # Get all chunks first to find valid IDs
+    resp = client.get("/chunks/undreamed?limit=1")
+    chunks = resp.json()["chunks"]
+    if not chunks:
+        # All might be dreamed from earlier test — try stats
+        pytest.skip("No undreamed chunks available")
+
+    chunk_id = chunks[0]["id"]
+    resp = client.post("/chunks/by_ids", json={"ids": [chunk_id]})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["chunks"]) == 1
+    assert data["chunks"][0]["id"] == chunk_id
+
+
+def test_chunks_by_ids_empty(client):
+    """chunks/by_ids with empty list returns empty."""
+    resp = client.post("/chunks/by_ids", json={"ids": []})
+    assert resp.status_code == 200
+    assert resp.json()["chunks"] == []

@@ -107,12 +107,15 @@ const CytoscapeGraph = forwardRef<CytoscapeGraphHandle, Props>(
 
       const elements: cytoscape.ElementDefinition[] = []
       for (const node of data.nodes) {
+        const isVibe = node.type === 'vibe'
         const el: cytoscape.ElementDefinition = {
           data: {
             id: node.id,
             label: node.text.slice(0, 60),
             type: node.type,
             fullText: node.text,
+            color: isVibe ? '#6366f1' : '#14b8a6',
+            borderColor: isVibe ? 'rgba(20, 184, 166, 0.25)' : 'rgba(99, 102, 241, 0.25)',
           },
         }
         if (hasPositions && node.position) {
@@ -147,16 +150,9 @@ const CytoscapeGraph = forwardRef<CytoscapeGraphHandle, Props>(
                 const d = degree[ele.id()] || 1
                 return Math.min(8 + d * 3, 40)
               },
-              'background-color'(ele: cytoscape.NodeSingular) {
-                return ele.data('type') === 'vibe' ? '#6366f1' : '#14b8a6'
-              },
+              'background-color': 'data(color)',
               'border-width': 1,
-              'border-color'(ele: cytoscape.NodeSingular) {
-                // Cross-color: vibes get teal outline, details get indigo
-                return ele.data('type') === 'vibe'
-                  ? 'rgba(20, 184, 166, 0.25)'
-                  : 'rgba(99, 102, 241, 0.25)'
-              },
+              'border-color': 'data(borderColor)',
             } as unknown as cytoscape.Css.Node,
           },
           {

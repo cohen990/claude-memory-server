@@ -278,9 +278,72 @@ Write a single updated description that integrates insights from the related mem
     return _claude(prompt).strip()
 
 
+def adjudicate_contest(node_text: str, correction: str,
+                       source_chunks: list[str]) -> dict:
+    """Ask Claude to adjudicate between a node's text and a proposed correction.
+
+    Returns {"verdict": "accept"|"reject"|"revise", "text": str, "reasoning": str}.
+    """
+    sources_section = ""
+    if source_chunks:
+        source_text = "\n---\n".join(source_chunks[:5])
+        sources_section = f"""
+
+Source conversations (the original context this memory was synthesized from):
+{source_text}
+"""
+
+    prompt = f"""A memory node has been contested by the agent. Decide whether the correction is valid.
+
+Current memory text:
+{node_text}
+
+Proposed correction:
+{correction}
+{sources_section}
+Decide:
+- ACCEPT: The correction is right. Replace the memory with corrected text.
+- REVISE: Both have partial truth. Write a revised version that incorporates the correction.
+- REJECT: The original is correct. Dismiss the correction.
+
+Respond with ONLY a JSON object (no markdown fences):
+{{"verdict": "accept|revise|reject", "text": "the final text (corrected, revised, or original)", "reasoning": "brief explanation"}}"""
+
+    ADJUDICATION_SCHEMA = json.dumps({
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ["accept", "revise", "reject"]},
+            "text": {"type": "string"},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["verdict", "text", "reasoning"],
+    })
+
+    return _claude(prompt, json_schema=ADJUDICATION_SCHEMA)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+def _fetch_chunks_by_ids(ids: list[str]) -> list[str]:
+    """Fetch chunk texts by ID from the server API."""
+    if not ids:
+        return []
+    body = json.dumps({"ids": ids}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{SERVER_URL}/chunks/by_ids",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        return [c["text"] for c in data.get("chunks", [])]
+    except Exception:
+        return []
+
 
 def _fetch_undreamed_chunks(days: int | None = None) -> tuple[list[str], list[str], list[dict]]:
     """Fetch un-dreamed chunks from the server API.
@@ -531,6 +594,48 @@ def cmd_reconsolidate(args):
     run_id = dream_log.start_run("reconsolidate")
     run_error = None
 
+    # 0. Adjudicate contested nodes
+    contested = graph.get_contested_nodes()
+    contests_resolved = 0
+
+    if contested:
+        print(f"Adjudicating {len(contested)} contested node(s)...")
+
+        for node in contested:
+            node_id = node["id"]
+            try:
+                source_chunks = _fetch_chunks_by_ids(node["source_ids"][:5])
+                result = adjudicate_contest(
+                    node["text"], node["contested_correction"], source_chunks,
+                )
+                verdict = result["verdict"]
+                new_text = result["text"]
+                reasoning = result["reasoning"]
+
+                print(f"  {node_id[:8]}... [{node['type']}]: {verdict}")
+                print(f"    Original: {node['text'][:80]}")
+                print(f"    Correction: {node['contested_correction'][:80]}")
+                print(f"    Reasoning: {reasoning[:120]}")
+
+                if verdict in ("accept", "revise"):
+                    new_embedding = embed_text(new_text)
+                    graph.resolve_contest(node_id, new_text, new_embedding)
+                    print(f"    → Updated: {new_text[:80]}")
+                else:
+                    graph.resolve_contest(node_id, None, None)
+                    print(f"    → Dismissed, original kept")
+
+                dream_log.log_operation(
+                    run_id, "contest_resolved", node_id, node["type"],
+                    {"verdict": verdict, "old_text": node["text"],
+                     "correction": node["contested_correction"],
+                     "new_text": new_text, "reasoning": reasoning})
+                contests_resolved += 1
+            except Exception as e:
+                print(f"  Warning: contest adjudication failed for {node_id[:8]}: {e}")
+                dream_log.log_operation(run_id, "error", node_id, None,
+                                        {"message": f"Contest adjudication failed: {e}"})
+
     # 1. Get reflected recalls — the only signal for edge weight changes
     reflected_recalls = graph.get_reflected_recalls()
     edges_adjusted = 0
@@ -670,6 +775,7 @@ def cmd_reconsolidate(args):
 
     s = graph.stats()
     print(f"\nReconsolidation complete.")
+    print(f"  Contests adjudicated: {contests_resolved}")
     print(f"  Nodes reconsolidated: {len(affected_nodes)}")
     print(f"  Texts re-synthesized: {resynthesized}")
     print(f"  Edges adjusted by reflections: {edges_adjusted}")

@@ -185,6 +185,16 @@ class GraphStore:
             self._conn.execute("ALTER TABLE recalls ADD COLUMN personal_surprisal REAL")
         self._conn.execute("DROP TABLE IF EXISTS rating_events")
 
+        # Add contested columns to nodes
+        node_cols = {
+            row[1] for row in
+            self._conn.execute("PRAGMA table_info(nodes)").fetchall()
+        }
+        if "contested_at" not in node_cols:
+            self._conn.execute("ALTER TABLE nodes ADD COLUMN contested_at TEXT")
+        if "contested_correction" not in node_cols:
+            self._conn.execute("ALTER TABLE nodes ADD COLUMN contested_correction TEXT")
+
         # Rename rating → reflection in recall_results
         rr_cols = {
             row[1] for row in
@@ -306,6 +316,88 @@ class GraphStore:
             )
             conn.commit()
         self._update_cache_embedding(node_id, embedding)
+
+    def contest_node(self, node_id_prefix: str, correction: str) -> dict:
+        """Mark a node as contested with a proposed correction.
+
+        Accepts a node ID prefix (at least 8 chars) and resolves to the full
+        UUID. Sets contested_at and contested_correction for dream adjudication.
+
+        Returns {"node_id": str, "text": str} on success.
+        Raises ValueError if prefix is ambiguous or not found.
+        """
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT id, text FROM nodes WHERE id LIKE ?",
+                (node_id_prefix + "%",),
+            ).fetchall()
+
+        if not rows:
+            raise ValueError(f"No node found matching prefix {node_id_prefix!r}")
+        if len(rows) > 1:
+            raise ValueError(
+                f"Ambiguous prefix {node_id_prefix!r} — matches {len(rows)} nodes. "
+                f"Use a longer prefix."
+            )
+
+        node_id, current_text = rows[0]
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE nodes SET contested_at = ?, contested_correction = ? WHERE id = ?",
+                (now, correction, node_id),
+            )
+            conn.commit()
+
+        return {"node_id": node_id, "text": current_text}
+
+    def get_contested_nodes(self) -> list[dict]:
+        """Return all nodes with pending contest corrections."""
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT id, type, text, contested_at, contested_correction, source_ids "
+                "FROM nodes WHERE contested_at IS NOT NULL",
+            ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "type": row[1],
+                "text": row[2],
+                "contested_at": row[3],
+                "contested_correction": row[4],
+                "source_ids": json.loads(row[5]),
+            }
+            for row in rows
+        ]
+
+    def resolve_contest(self, node_id: str, new_text: str | None,
+                        new_embedding: np.ndarray | None):
+        """Clear a contest, optionally updating the node text.
+
+        If new_text is provided, the node text and embedding are updated.
+        If None, the contest is dismissed (original text kept).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as conn:
+            if new_text is not None and new_embedding is not None:
+                conn.execute(
+                    "UPDATE nodes SET text = ?, embedding = ?, "
+                    "contested_at = NULL, contested_correction = NULL, "
+                    "updated_at = ? WHERE id = ?",
+                    (new_text, embedding_to_blob(new_embedding), now, node_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE nodes SET contested_at = NULL, "
+                    "contested_correction = NULL WHERE id = ?",
+                    (node_id,),
+                )
+            conn.commit()
+
+        if new_embedding is not None:
+            self._update_cache_embedding(node_id, new_embedding)
 
     def merge_node_embedding(self, node_id: str, new_embedding: np.ndarray,
                              new_source_ids: list[str] | None = None):
@@ -602,6 +694,38 @@ class GraphStore:
                 )
             conn.commit()
 
+    def reflect_on_node(self, recall_id: str, node_id_prefix: str,
+                        reflection: str) -> bool:
+        """Update the reflection for a single node within a recall.
+
+        Looks up the node by ID prefix within the recall's results.
+        Returns True if a match was found and updated.
+        """
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT node_id FROM recall_results "
+                "WHERE recall_id = ? AND node_id LIKE ?",
+                (recall_id, node_id_prefix + "%"),
+            ).fetchall()
+
+        if not rows:
+            return False
+        if len(rows) > 1:
+            raise ValueError(
+                f"Ambiguous prefix {node_id_prefix!r} in recall {recall_id} — "
+                f"matches {len(rows)} results"
+            )
+
+        node_id = rows[0][0]
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE recall_results SET reflection = ? "
+                "WHERE recall_id = ? AND node_id = ?",
+                (reflection, recall_id, node_id),
+            )
+            conn.commit()
+        return True
+
     def get_reflected_recalls(self) -> list[dict]:
         """Return un-dreamed recalls that have at least one reflected result.
 
@@ -839,6 +963,7 @@ class GraphStore:
         component_positions: list[dict[str, tuple[float, float]]] = []
         component_sizes: list[int] = []
 
+        total_nodes = len(node_rows)
         for comp_nodes in components:
             subgraph = G.subgraph(comp_nodes)
             n = len(comp_nodes)
@@ -846,6 +971,7 @@ class GraphStore:
                 subgraph, weight="weight", iterations=100,
                 seed=42, scale=math.sqrt(n),
             )
+
             component_positions.append({n: (float(x), float(y)) for n, (x, y) in pos.items()})
             component_sizes.append(len(comp_nodes))
 
@@ -885,10 +1011,65 @@ class GraphStore:
                 offset_y += row_height + spacing
                 row_height = 0.0
 
-        # Scale to pixel-space
+        # Scale to pixel-space.
+        # FR with scale=sqrt(N) gives roughly constant inter-node distance
+        # in layout units, but higher edge density compresses the layout.
+        # Compensate: px_per_unit grows with density relative to a baseline.
+        # Calibrated at 1520 nodes / 2000 edges (density ~1.3), px=75.
+        total_edges = len(edge_rows)
+        density = total_edges / max(total_nodes, 1)
+        baseline_density = 1.0
+        px_per_unit = 75 * max(1.0, density / baseline_density)
         for pos in positions.values():
-            pos["x"] = round(pos["x"] * 75, 1)
-            pos["y"] = round(pos["y"] * 75, 1)
+            pos["x"] = round(pos["x"] * px_per_unit, 1)
+            pos["y"] = round(pos["y"] * px_per_unit, 1)
+
+        # Local repulsion pass — inflate dense clusters so nodes are readable.
+        # Like a Mercator projection: distorts distances but preserves
+        # relative topology while making dense regions navigable.
+        # min_dist is per-pair: sum of radii + padding, so large nodes
+        # (high degree) get more clearance.
+        degree = dict(G.degree())
+        def _node_radius(node_id: str) -> float:
+            """Match frontend: min(8 + degree*3, 40) / 2."""
+            d = degree.get(node_id, 1)
+            return min(8 + d * 3, 40) / 2
+
+        padding = 10.0  # extra px clearance beyond touching
+        ids = list(positions.keys())
+        n_nodes = len(ids)
+        if n_nodes > 1:
+            radii = [_node_radius(nid) for nid in ids]
+            for _ in range(5):  # iterate to convergence
+                moved = 0
+                for i in range(n_nodes):
+                    pi = positions[ids[i]]
+                    for j in range(i + 1, n_nodes):
+                        pj = positions[ids[j]]
+                        required = radii[i] + radii[j] + padding
+                        dx = pi["x"] - pj["x"]
+                        dy = pi["y"] - pj["y"]
+                        dist = math.sqrt(dx * dx + dy * dy)
+                        if dist < required and dist > 0:
+                            push = (required - dist) / 2
+                            ux, uy = dx / dist, dy / dist
+                            pi["x"] += ux * push
+                            pi["y"] += uy * push
+                            pj["x"] -= ux * push
+                            pj["y"] -= uy * push
+                            moved += 1
+                        elif dist == 0:
+                            import random
+                            angle = random.random() * 2 * math.pi
+                            pi["x"] += math.cos(angle) * required / 2
+                            pi["y"] += math.sin(angle) * required / 2
+                            moved += 1
+                if moved == 0:
+                    break
+            # Round after repulsion
+            for pos in positions.values():
+                pos["x"] = round(pos["x"], 1)
+                pos["y"] = round(pos["y"], 1)
 
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "w") as f:
@@ -896,19 +1077,16 @@ class GraphStore:
 
         return positions
 
-    def get_full_graph(self, node_limit: int = 2000,
-                       edge_limit: int = 5000) -> dict:
+    def get_full_graph(self) -> dict:
         """All nodes + edges for Cytoscape.js initial load (no embeddings)."""
         with self._db() as conn:
             node_rows = conn.execute(
                 "SELECT id, type, text, created_at, updated_at, source_ids "
-                "FROM nodes LIMIT ?",
-                (node_limit,),
+                "FROM nodes",
             ).fetchall()
             edge_rows = conn.execute(
                 "SELECT source_id, target_id, weight, created_at, last_activated, activation_count "
-                "FROM edges LIMIT ?",
-                (edge_limit,),
+                "FROM edges",
             ).fetchall()
 
         # Load cached layout positions
