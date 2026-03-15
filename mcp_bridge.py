@@ -370,6 +370,12 @@ async def reflect(r: str):
     except httpx.ConnectError:
         return f"Error: Cannot connect to memory server at {SERVER_URL}. Is it running?"
     except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return (
+                f"Recall {recall_id} not found — wrong ID. "
+                f"Use the recall ID from the [recall:...] tag in the most recent "
+                f"AGENT MEMORY injection and try again."
+            )
         return f"Error: {e.response.status_code}: {e.response.json().get('error', e.response.text)}"
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}"
@@ -427,6 +433,12 @@ async def re_reflect(r: str):
     except httpx.ConnectError:
         return f"Error: Cannot connect to memory server at {SERVER_URL}. Is it running?"
     except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return (
+                f"Recall or node not found — wrong ID. "
+                f"Use the recall ID and node ID prefix from the [recall:...] and "
+                f"[node_id] tags in the AGENT MEMORY injection and try again."
+            )
         return f"Error: {e.response.status_code}: {e.response.json().get('error', e.response.text)}"
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}"
