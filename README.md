@@ -94,11 +94,11 @@ The server runs an embedding model ([nomic-embed-text-v1.5](https://huggingface.
 | Disk | 2 GB | 10+ GB (scales with conversation history) |
 | Python | 3.10 | 3.12 or 3.13 |
 
-**GPU notes**: A CUDA-capable GPU (RTX 20-series or newer) speeds up embedding ~5-10x but is not required. Older GPUs (GTX 900/1000 series) won't work with current PyTorch — use `EMBED_DEVICE=cpu` instead. The graph layer and ChromaDB are CPU-only regardless.
+**GPU notes**: A CUDA-capable GPU (RTX 20-series or newer) speeds up embedding ~5-10x but is not required. Older GPUs (GTX 900/1000 series) won't work with current PyTorch — use `EMBED_DEVICE=cpu` instead. On Apple Silicon Macs, use `EMBED_DEVICE=mps` for hardware-accelerated embedding. The graph layer and ChromaDB are CPU-only regardless.
 
-**Separate machine**: The server is designed to run on a dedicated machine (even an old one gathering dust) so embedding doesn't compete with your dev workload. A direct ethernet cable or LAN connection to your dev machine is all you need. It also works fine on the same machine if you prefer.
+**Separate machine**: The server is designed to run on a dedicated machine (even an old one gathering dust) so embedding doesn't compete with your dev workload. A direct ethernet cable or LAN connection to your dev machine is all you need. It also works fine on the same machine if you prefer — this is the typical setup on macOS.
 
-## Setup — Server Machine
+## Setup — Server
 
 ### 1. Install dependencies
 
@@ -119,7 +119,136 @@ python server.py
 
 The server binds to `0.0.0.0:8420` by default. ChromaDB persists to `~/.memory-server/chromadb`, graph to `~/.memory-server/graph.db`.
 
-### 3. (Optional) systemd service
+### 3. Memory Browser UI (optional)
+
+A read-only web UI for exploring the graph. Runs as a separate lightweight process — no embedding model loaded.
+
+```bash
+python browse.py
+```
+
+Binds to `0.0.0.0:8421`. Open `http://your-server:8421` to browse. Four tabs:
+
+- **Graph** — Cytoscape.js force-directed layout of all nodes and edges. Click a node to see its text, metadata, and neighbors.
+- **Recalls** — Recent memory injections with reflections. Filter by session ID.
+- **Stats** — Node/edge counts, reflection distribution, and ChromaDB collection sizes (proxied from the main server). Reflection timeline charts support **markers** — dashed vertical annotations for tracking the impact of changes over time.
+- **Dreams** — Live view of dream pipeline runs. Shows consolidation/reconsolidation status, operation counts, and per-operation detail.
+
+Create a marker via the server API:
+
+```bash
+curl -X POST http://your-server:8420/graph/marker \
+  -H 'Content-Type: application/json' \
+  -d '{"label": "min_sim 0.65"}'
+```
+
+### 4. Run as a service
+
+#### macOS (launchd)
+
+Create `~/Library/LaunchAgents/com.memory-server.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memory-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/memory-server/.venv/bin/python</string>
+        <string>server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/memory-server</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>EMBED_DEVICE</key>
+        <string>mps</string>
+        <key>BIND_HOST</key>
+        <string>127.0.0.1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.memory-server/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.memory-server/server.log</string>
+</dict>
+</plist>
+```
+
+Set `EMBED_DEVICE` to `mps` on Apple Silicon Macs, or `cpu` on Intel Macs. Set `BIND_HOST` to `127.0.0.1` when running everything on the same machine (the default `0.0.0.0` listens on all interfaces).
+
+Load and start:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.memory-server.plist
+```
+
+The service starts automatically on login (`RunAtLoad`) and restarts on crash (`KeepAlive`). Logs go to `~/.memory-server/server.log`.
+
+To stop/start manually:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.memory-server.plist
+
+launchctl load ~/Library/LaunchAgents/com.memory-server.plist
+```
+
+For the browse UI, create `~/Library/LaunchAgents/com.memory-server.browse.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memory-server.browse</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/memory-server/.venv/bin/python</string>
+        <string>browse.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/memory-server</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BROWSE_HOST</key>
+        <string>127.0.0.1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.memory-server/browse.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.memory-server/browse.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.memory-server.browse.plist
+```
+
+#### Linux (systemd)
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -152,29 +281,7 @@ sudo loginctl enable-linger $USER
 
 The server uses CUDA by default. If your GPU is older (CUDA compute capability below 7.0, e.g. GTX 900 series or earlier), add `Environment=EMBED_DEVICE=cpu` to the service file. CPU embedding is slower but works fine.
 
-### 4. (Optional) Memory Browser UI
-
-A read-only web UI for exploring the graph. Runs as a separate lightweight process — no embedding model loaded.
-
-```bash
-python browse.py
-```
-
-Binds to `0.0.0.0:8421`. Open `http://your-server:8421` to browse. Three tabs:
-
-- **Graph** — Cytoscape.js force-directed layout of all nodes and edges. Click a node to see its text, metadata, and neighbors.
-- **Recalls** — Recent memory injections with reflections. Filter by session ID.
-- **Stats** — Node/edge counts, reflection distribution, and ChromaDB collection sizes (proxied from the main server). Reflection timeline charts support **markers** — dashed vertical annotations for tracking the impact of changes over time.
-
-Create a marker via the server API:
-
-```bash
-curl -X POST http://your-server:8420/graph/marker \
-  -H 'Content-Type: application/json' \
-  -d '{"label": "min_sim 0.65"}'
-```
-
-As a systemd service:
+For the browse UI:
 
 ```bash
 cat > ~/.config/systemd/user/memory-browse.service << 'EOF'
@@ -373,17 +480,91 @@ Chunks are marked after processing — re-running won't reprocess already-consol
 
 ### Scheduling
 
-The dream pipeline uses `claude -p` (the Claude CLI in non-interactive mode) for synthesis. Make sure `claude` is installed and authenticated on the server machine (`claude login`).
+The dream pipeline uses `claude -p` (the Claude CLI in non-interactive mode) for synthesis. Make sure `claude` is installed and authenticated on the machine (`claude login`).
 
-Run nightly via cron:
+Set the `CLAUDE_CLI` environment variable to the full path of the `claude` binary. This is required for scheduled execution because launchd and cron don't inherit your shell's PATH. Find it with `which claude`.
+
+#### macOS (launchd)
+
+Create `~/Library/LaunchAgents/com.memory-server.dream.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memory-server.dream</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/memory-server/.venv/bin/python</string>
+        <string>dream.py</string>
+        <string>full</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/memory-server</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MEMORY_SERVER_URL</key>
+        <string>http://localhost:8420</string>
+        <key>CLAUDE_CLI</key>
+        <string>/opt/homebrew/bin/claude</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.memory-server/dream.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.memory-server/dream.log</string>
+</dict>
+</plist>
+```
+
+Update the `CLAUDE_CLI` path — it's `/opt/homebrew/bin/claude` on Apple Silicon Macs (Homebrew default) or `/usr/local/bin/claude` on Intel Macs.
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.memory-server.dream.plist
+```
+
+The dream runs daily at 4:00 AM. Unlike the server/browse agents, it has no `KeepAlive` — it runs once and exits. To trigger a manual run:
+
+```bash
+launchctl start com.memory-server.dream
+```
+
+Check logs at `~/.memory-server/dream.log`.
+
+#### Linux (cron)
 
 ```
-0 4 * * * cd ~/memory-server && .venv/bin/python dream.py full >> ~/.claude-sync/dream.log 2>&1
+0 4 * * * cd ~/memory-server && CLAUDE_CLI=/usr/local/bin/claude .venv/bin/python dream.py full >> ~/.memory-server/dream.log 2>&1
 ```
 
 ## Deployment
 
-If the server runs on a separate machine, sync code changes with rsync:
+On macOS with everything running locally, just `git pull` and reload the launchd agents:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.memory-server.plist
+launchctl load ~/Library/LaunchAgents/com.memory-server.plist
+
+launchctl unload ~/Library/LaunchAgents/com.memory-server.browse.plist
+launchctl load ~/Library/LaunchAgents/com.memory-server.browse.plist
+```
+
+The dream agent picks up code changes on its next scheduled run — no reload needed.
+
+If the server runs on a separate Linux machine, sync code changes with rsync:
 
 ```bash
 rsync -avz --exclude=__pycache__ --exclude=.pytest_cache --exclude='*.pyc' \
@@ -433,10 +614,11 @@ curl -X POST http://your-server:8420/search_graph \
 | `INCOMING_DIR` | `~/.memory-server/incoming` | server.py |
 | `GRAPH_DB_PATH` | `~/.memory-server/graph.db` | graph.py |
 | `EMBED_MODEL` | `nomic-ai/nomic-embed-text-v1.5` | server.py |
-| `EMBED_DEVICE` | `cuda` | server.py — set to `cpu` for older GPUs (compute capability < 7.0) |
+| `EMBED_DEVICE` | `cuda` | server.py — `mps` for Apple Silicon Macs, `cpu` for Intel Macs or older CUDA GPUs (compute capability < 7.0) |
 | `WORKER_INTERVAL` | `2.0` | server.py |
 | `MEMORY_DISTANCE_THRESHOLD` | `0.5` | prompt_hook.py |
 | `MEMORY_MAX_RESULTS` | `5` | prompt_hook.py |
+| `CLAUDE_CLI` | `claude` | dream.py — full path to the Claude CLI binary (e.g. `/opt/homebrew/bin/claude`). Required for launchd/cron which don't inherit shell PATH |
 | `DREAM_MODEL` | `sonnet` | dream.py |
 | `SIMILARITY_THRESHOLD` | `0.85` | dream.py |
 | `REFLECTION_SCALE` | `0.02` | dream.py — multiplier for reflection-driven edge weight changes |
@@ -456,6 +638,9 @@ If the server crashes with a segfault (exit code 139, stack trace in `chromadb_r
 
 ```bash
 # Stop the server
+# macOS:
+launchctl unload ~/Library/LaunchAgents/com.memory-server.plist
+# Linux:
 systemctl --user stop memory-server
 
 # Identify collection UUID directories
@@ -466,6 +651,9 @@ sqlite3 ~/.memory-server/chromadb/chroma.sqlite3 \
 rm -rf ~/.memory-server/chromadb/<uuid-from-above>
 
 # Restart — ChromaDB rebuilds the index automatically
+# macOS:
+launchctl load ~/Library/LaunchAgents/com.memory-server.plist
+# Linux:
 systemctl --user start memory-server
 ```
 
@@ -480,7 +668,7 @@ Only if the SQLite data itself is corrupted or collections need schema changes:
 ```bash
 rm -rf ~/.memory-server/chromadb
 rm -f ~/.memory-server/ingested_sessions.json
-systemctl --user restart memory-server
+# Restart the server (macOS: unload/load the plist, Linux: systemctl --user restart memory-server)
 MEMORY_SERVER_URL=http://your-server:8420 python batch_import.py --reset
 ```
 

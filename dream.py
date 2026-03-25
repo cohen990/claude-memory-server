@@ -14,6 +14,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -29,6 +30,7 @@ from graph import GraphStore, DreamLog
 # ---------------------------------------------------------------------------
 
 SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
+CLAUDE_CLI = shutil.which(os.environ.get("CLAUDE_CLI", "claude"))
 DREAM_MODEL = os.environ.get("DREAM_MODEL", "sonnet")
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.85"))
 STALENESS_THRESHOLD = float(os.environ.get("STALENESS_THRESHOLD", "0.15"))
@@ -189,7 +191,7 @@ def _claude(prompt: str, json_schema: str | None = None) -> str | dict:
     Otherwise returns the text result string.
     """
     cmd = [
-        "claude", "-p",
+        CLAUDE_CLI, "-p",
         "--model", DREAM_MODEL,
         "--no-session-persistence",
         "--output-format", "json",
@@ -822,6 +824,9 @@ def main():
     p_stats = sub.add_parser("stats", help="Print graph statistics")
 
     args = parser.parse_args()
+
+    if not CLAUDE_CLI:
+        sys.exit("Error: claude CLI not found. Set CLAUDE_CLI to the full path (e.g. /opt/homebrew/bin/claude).")
 
     commands = {
         "consolidate": cmd_consolidate,
