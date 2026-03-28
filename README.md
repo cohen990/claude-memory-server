@@ -466,6 +466,9 @@ python dream.py consolidate
 # Limit to last 7 days only
 python dream.py consolidate --days 7
 
+# Smaller batches to avoid timeouts on large backlogs
+python dream.py consolidate --batch-size 10
+
 # Process rated recalls (adjust edge weights, reconsolidate embeddings)
 python dream.py reconsolidate
 
@@ -620,7 +623,9 @@ curl -X POST http://your-server:8420/search_graph \
 | `MEMORY_MAX_RESULTS` | `5` | prompt_hook.py |
 | `CLAUDE_CLI` | `claude` | dream.py — full path to the Claude CLI binary (e.g. `/opt/homebrew/bin/claude`). Required for launchd/cron which don't inherit shell PATH |
 | `DREAM_MODEL` | `sonnet` | dream.py |
+| `DREAM_BATCH_SIZE` | `20` | dream.py — chunks per synthesis batch. Lower values (10-12) reduce timeouts on large backlogs. Also settable via `--batch-size` CLI flag |
 | `SIMILARITY_THRESHOLD` | `0.85` | dream.py |
+| `STALENESS_THRESHOLD` | `0.15` | dream.py — cosine distance above which a node's text is re-synthesized |
 | `REFLECTION_SCALE` | `0.02` | dream.py — multiplier for reflection-driven edge weight changes |
 | `BROWSE_HOST` | `0.0.0.0` | browse.py |
 | `BROWSE_PORT` | `8421` | browse.py |

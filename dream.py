@@ -5,9 +5,9 @@ calls the memory server HTTP API for embeddings, and the Claude CLI for
 LLM synthesis (uses OAuth creds, no API key needed).
 
 Usage:
-    python dream.py consolidate --days 7
+    python dream.py consolidate --days 7 --batch-size 10
     python dream.py reconsolidate
-    python dream.py full --days 7
+    python dream.py full --days 7 --batch-size 10
     python dream.py stats
 """
 
@@ -32,6 +32,7 @@ from graph import GraphStore, DreamLog
 SERVER_URL = os.environ.get("MEMORY_SERVER_URL", "http://localhost:8420")
 CLAUDE_CLI = shutil.which(os.environ.get("CLAUDE_CLI", "claude"))
 DREAM_MODEL = os.environ.get("DREAM_MODEL", "sonnet")
+BATCH_SIZE = int(os.environ.get("DREAM_BATCH_SIZE", "20"))
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.85"))
 STALENESS_THRESHOLD = float(os.environ.get("STALENESS_THRESHOLD", "0.15"))
 REFLECTION_SCALE = float(os.environ.get("REFLECTION_SCALE", "0.02"))
@@ -400,7 +401,7 @@ def cmd_consolidate(args):
     print(f"Found {len(docs)} un-dreamed chunks.")
 
     # Process in batches to stay within context limits
-    batch_size = 20
+    batch_size = getattr(args, "batch_size", None) or BATCH_SIZE
     graph = GraphStore()
     dream_log = DreamLog(graph)
     run_id = dream_log.start_run("consolidate")
@@ -815,11 +816,13 @@ def main():
 
     p_consolidate = sub.add_parser("consolidate", help="Synthesize recent conversations into graph nodes")
     p_consolidate.add_argument("--days", type=int, default=None, help="Limit to last N days (default: all un-dreamed)")
+    p_consolidate.add_argument("--batch-size", type=int, default=None, help=f"Chunks per synthesis batch (default: {BATCH_SIZE}, env DREAM_BATCH_SIZE)")
 
     p_reconsolidate = sub.add_parser("reconsolidate", help="Process activated edges and reconsolidate embeddings")
 
     p_full = sub.add_parser("full", help="Full dream cycle: consolidate + reconsolidate")
     p_full.add_argument("--days", type=int, default=None, help="Limit to last N days (default: all un-dreamed)")
+    p_full.add_argument("--batch-size", type=int, default=None, help=f"Chunks per synthesis batch (default: {BATCH_SIZE}, env DREAM_BATCH_SIZE)")
 
     p_stats = sub.add_parser("stats", help="Print graph statistics")
 
