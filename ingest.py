@@ -187,7 +187,7 @@ def ingest_chunks(chunks: list[dict], server_url: str = SERVER_URL) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read())
     except urllib.error.URLError as e:
         return {"error": str(e)}
@@ -211,7 +211,7 @@ def ingest_summary(text: str, session_id: str, timestamp: str,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read())
     except urllib.error.URLError as e:
         return {"error": str(e)}

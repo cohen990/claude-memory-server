@@ -10,9 +10,11 @@ returns 201 immediately. A background worker embeds and stores them.
 
 import asyncio
 import json
+import multiprocessing
 import os
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -50,6 +52,112 @@ DOCUMENT_PREFIX = "search_document: "
 
 MMR_LAMBDA = 0.7        # relevance vs diversity tradeoff (1.0 = pure relevance)
 MMR_OVERFETCH = 3       # fetch this many times k candidates for MMR pool
+
+
+# ---------------------------------------------------------------------------
+# Embed worker process — runs in a separate process to avoid GIL contention
+# ---------------------------------------------------------------------------
+
+_worker_model = None
+
+
+def _init_embed_worker():
+    """Initialize the embedding model in the worker process."""
+    global _worker_model
+    from sentence_transformers import SentenceTransformer
+    _worker_model = SentenceTransformer(MODEL_NAME, trust_remote_code=True, device=DEVICE)
+    _worker_model.truncate_dim = 768
+    print(f"Embed worker process initialized (device={DEVICE}, pid={os.getpid()})")
+
+
+def _embed_one_file_in_worker(path: Path) -> dict:
+    """Read a queued chunk file and compute embeddings in the worker process.
+
+    Identical logic to the old _embed_one_file, but uses the worker-local model.
+    """
+    from surprisal import tokenize as _tokenize
+
+    with open(path) as f:
+        item = json.load(f)
+
+    text = item["text"]
+    embedding = _worker_model.encode([DOCUMENT_PREFIX + text], show_progress_bar=False).tolist()
+
+    session_id = item.get("session_id", "")
+    turn_number = item.get("turn_number", -1)
+    doc_id = f"{session_id}_{turn_number}"
+    metadata = {
+        "session_id": session_id,
+        "timestamp": item.get("timestamp", ""),
+        "project": item.get("project", ""),
+        "turn_number": turn_number,
+        "branch": item.get("branch", ""),
+        "chunk_type": item.get("chunk_type", "turn_pair"),
+        "dreamed": 0,
+    }
+
+    result = {
+        "doc_id": doc_id,
+        "text": text,
+        "embedding": embedding,
+        "metadata": metadata,
+        "session_id": session_id,
+        "turn_number": turn_number,
+    }
+
+    # Compute subchunk embeddings
+    windows = make_subchunks(text)
+    if windows:
+        sc_ids = []
+        sc_documents = []
+        sc_metadatas = []
+        for i, window_text in enumerate(windows):
+            sc_ids.append(f"{doc_id}_sc{i}")
+            sc_documents.append(window_text)
+            sc_metadatas.append({
+                "session_id": session_id,
+                "timestamp": metadata["timestamp"],
+                "project": metadata["project"],
+                "turn_number": turn_number,
+                "branch": metadata["branch"],
+                "chunk_type": "subchunk",
+                "parent_chunk_id": doc_id,
+                "window_index": i,
+            })
+        sc_embeddings = _worker_model.encode(
+            [DOCUMENT_PREFIX + t for t in sc_documents],
+            show_progress_bar=False,
+        ).tolist()
+        result["subchunks"] = {
+            "ids": sc_ids,
+            "embeddings": sc_embeddings,
+            "documents": sc_documents,
+            "metadatas": sc_metadatas,
+        }
+
+    # Compute user input embedding
+    user_text = item.get("user_text", "")
+    if user_text:
+        ui_embedding = _worker_model.encode(
+            [DOCUMENT_PREFIX + user_text], show_progress_bar=False
+        ).tolist()
+        result["user_input"] = {
+            "id": f"{doc_id}_ui",
+            "embedding": ui_embedding,
+            "text": user_text,
+            "metadata": {
+                "session_id": session_id,
+                "timestamp": metadata["timestamp"],
+                "project": metadata["project"],
+                "turn_number": turn_number,
+                "branch": metadata["branch"],
+                "chunk_type": "user_input",
+                "parent_chunk_id": doc_id,
+            },
+        }
+        result["user_words"] = _tokenize(user_text)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +220,7 @@ collection: chromadb.Collection = None  # type: ignore[assignment]
 subchunk_collection: chromadb.Collection = None  # type: ignore[assignment]
 user_input_collection: chromadb.Collection = None  # type: ignore[assignment]
 worker_task: asyncio.Task = None  # type: ignore[assignment]
+embed_pool: ProcessPoolExecutor = None  # type: ignore[assignment]
 graph_store = None  # GraphStore instance, initialized at startup
 
 
@@ -128,95 +237,6 @@ def make_subchunks(text: str, window: int = SUBCHUNK_WINDOW, overlap: int = SUBC
         start += window - overlap
     return chunks
 
-
-def _embed_one_file(path: Path) -> dict:
-    """Read a queued chunk file and compute embeddings. Returns data for ChromaDB upsert.
-
-    This runs in a thread pool — it does CPU-heavy embedding but does NOT
-    touch ChromaDB, keeping all ChromaDB access on the event loop thread.
-    """
-    with open(path) as f:
-        item = json.load(f)
-
-    chunk_type = item.get("chunk_type", "turn_pair")
-    text = item["text"]
-    embedding = model.encode([DOCUMENT_PREFIX + text], show_progress_bar=False).tolist()
-
-    session_id = item.get("session_id", "")
-    turn_number = item.get("turn_number", -1)
-    doc_id = f"{session_id}_{turn_number}"
-    metadata = {
-        "session_id": session_id,
-        "timestamp": item.get("timestamp", ""),
-        "project": item.get("project", ""),
-        "turn_number": turn_number,
-        "branch": item.get("branch", ""),
-        "chunk_type": chunk_type,
-        "dreamed": 0,
-    }
-
-    result = {
-        "doc_id": doc_id,
-        "text": text,
-        "embedding": embedding,
-        "metadata": metadata,
-        "session_id": session_id,
-        "turn_number": turn_number,
-    }
-
-    # Compute subchunk embeddings
-    windows = make_subchunks(text)
-    if windows:
-        sc_ids = []
-        sc_documents = []
-        sc_metadatas = []
-        for i, window_text in enumerate(windows):
-            sc_ids.append(f"{doc_id}_sc{i}")
-            sc_documents.append(window_text)
-            sc_metadatas.append({
-                "session_id": session_id,
-                "timestamp": metadata["timestamp"],
-                "project": metadata["project"],
-                "turn_number": turn_number,
-                "branch": metadata["branch"],
-                "chunk_type": "subchunk",
-                "parent_chunk_id": doc_id,
-                "window_index": i,
-            })
-        sc_embeddings = model.encode(
-            [DOCUMENT_PREFIX + t for t in sc_documents],
-            show_progress_bar=False,
-        ).tolist()
-        result["subchunks"] = {
-            "ids": sc_ids,
-            "embeddings": sc_embeddings,
-            "documents": sc_documents,
-            "metadatas": sc_metadatas,
-        }
-
-    # Compute user input embedding
-    user_text = item.get("user_text", "")
-    if user_text:
-        ui_embedding = model.encode(
-            [DOCUMENT_PREFIX + user_text], show_progress_bar=False
-        ).tolist()
-        result["user_input"] = {
-            "id": f"{doc_id}_ui",
-            "embedding": ui_embedding,
-            "text": user_text,
-            "metadata": {
-                "session_id": session_id,
-                "timestamp": metadata["timestamp"],
-                "project": metadata["project"],
-                "turn_number": turn_number,
-                "branch": metadata["branch"],
-                "chunk_type": "user_input",
-                "parent_chunk_id": doc_id,
-            },
-        }
-        result["user_words"] = tokenize(user_text)
-
-    return result
 
 
 def _store_one_file(data: dict, path: Path):
@@ -259,9 +279,9 @@ def _store_one_file(data: dict, path: Path):
 async def queue_worker():
     """Background loop that processes the incoming queue.
 
-    Embedding (CPU-heavy) runs in a thread pool. ChromaDB upserts run on the
-    event loop thread so that all ChromaDB access is single-threaded — ChromaDB's
-    PersistentClient is not thread-safe.
+    Embedding runs in a separate process (ProcessPoolExecutor) so the GIL
+    in the worker can't block the server's event loop. ChromaDB upserts run
+    on the event loop thread — ChromaDB's PersistentClient is not thread-safe.
     """
     incoming = Path(INCOMING_DIR)
     processed_total = 0
@@ -273,8 +293,10 @@ async def queue_worker():
                 print(f"Queue: {len(files)} pending")
             for i, path in enumerate(files):
                 try:
-                    # Embed in thread pool (CPU-heavy)
-                    data = await loop.run_in_executor(None, _embed_one_file, path)
+                    # Embed in worker process (separate GIL)
+                    data = await loop.run_in_executor(
+                        embed_pool, _embed_one_file_in_worker, path,
+                    )
                     # Store in ChromaDB on event loop thread (not thread-safe)
                     _store_one_file(data, path)
                     processed_total += 1
@@ -301,7 +323,7 @@ async def queue_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, collection, subchunk_collection, user_input_collection, worker_task, graph_store
+    global model, collection, subchunk_collection, user_input_collection, worker_task, graph_store, embed_pool
 
     print(f"Loading embedding model: {MODEL_NAME} (device={DEVICE})")
     model = SentenceTransformer(MODEL_NAME, trust_remote_code=True, device=DEVICE)
@@ -334,6 +356,12 @@ async def lifespan(app: FastAPI):
     gs = graph_store.stats()
     print(f"Graph store ready ({gs['total_nodes']} nodes, {gs['total_edges']} edges).")
 
+    # Start embed worker process pool (separate process = separate GIL)
+    # Use spawn context — fork is not safe with MPS/Metal on macOS
+    ctx = multiprocessing.get_context("spawn")
+    embed_pool = ProcessPoolExecutor(max_workers=1, initializer=_init_embed_worker, mp_context=ctx)
+    print("Embed worker process pool started.")
+
     # Start background queue worker
     worker_task = asyncio.create_task(queue_worker())
     print("Queue worker started.")
@@ -345,6 +373,7 @@ async def lifespan(app: FastAPI):
         await worker_task
     except asyncio.CancelledError:
         pass
+    embed_pool.shutdown(wait=False)
 
 
 app = FastAPI(title="memory-server", lifespan=lifespan)
