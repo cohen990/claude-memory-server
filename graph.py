@@ -58,7 +58,7 @@ class GraphStore:
         self._conn = sqlite3.connect(self.db_path,
                                      check_same_thread=check_same_thread)
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._lock = threading.Lock()
         self._create_schema()
         self._rebuild_cache()
