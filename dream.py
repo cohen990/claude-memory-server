@@ -128,7 +128,7 @@ def embed_text(text: str) -> np.ndarray:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.loads(resp.read())
     return np.array(data["embedding"], dtype=np.float32)
 
@@ -142,7 +142,7 @@ def reload_cache():
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             return json.loads(resp.read())
     except Exception as e:
         print(f"Warning: Could not reload server cache: {e}")
@@ -158,7 +158,7 @@ def recompute_layout():
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.loads(resp.read())
             print(f"  Layout recomputed: {data.get('nodes_positioned', 0)} nodes positioned")
             return data
@@ -372,7 +372,7 @@ def _fetch_chunks_by_ids(ids: list[str]) -> list[str]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.loads(resp.read())
         return [c["text"] for c in data.get("chunks", [])]
     except Exception:
@@ -393,7 +393,7 @@ def _fetch_undreamed_chunks(days: int | None = None) -> tuple[list[str], list[st
         url += f"?{qs}"
 
     req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.loads(resp.read())
 
     docs = [c["text"] for c in data["chunks"]]
@@ -412,7 +412,7 @@ def _mark_chunks_dreamed(batch_ids: list[str], batch_metas: list[dict]):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=300) as resp:
         return json.loads(resp.read())
 
 
