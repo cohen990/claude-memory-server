@@ -26,6 +26,26 @@ import numpy as np
 from graph import GraphStore, DreamLog
 
 # ---------------------------------------------------------------------------
+# Optional local embedding model (avoids GPU contention with other workloads)
+# ---------------------------------------------------------------------------
+
+DREAM_EMBED_DEVICE = os.environ.get("DREAM_EMBED_DEVICE", "")
+_local_model = None
+
+
+def _get_local_model():
+    """Lazily load a SentenceTransformer on the configured device."""
+    global _local_model
+    if _local_model is None:
+        from sentence_transformers import SentenceTransformer
+        model_name = os.environ.get("EMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5")
+        print(f"Loading local embedding model: {model_name} (device={DREAM_EMBED_DEVICE})")
+        _local_model = SentenceTransformer(model_name, trust_remote_code=True, device=DREAM_EMBED_DEVICE)
+        _local_model.truncate_dim = 768
+        print("Local embedding model loaded.")
+    return _local_model
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -89,7 +109,18 @@ def _apply_reflection_delta(old_weight: float, delta: float,
 
 
 def embed_text(text: str) -> np.ndarray:
-    """Get embedding from memory server's /embed endpoint."""
+    """Get embedding for text.
+
+    When DREAM_EMBED_DEVICE is set, computes locally on that device (e.g. "cpu")
+    to avoid GPU contention. Otherwise calls the memory server's /embed endpoint.
+    """
+    if DREAM_EMBED_DEVICE:
+        model = _get_local_model()
+        embedding = model.encode(
+            ["search_document: " + text], show_progress_bar=False,
+        )[0]
+        return np.array(embedding, dtype=np.float32)
+
     body = json.dumps({"text": text}).encode("utf-8")
     req = urllib.request.Request(
         f"{SERVER_URL}/embed",
@@ -814,19 +845,29 @@ def main():
     parser = argparse.ArgumentParser(description="Dream pipeline — nightly memory consolidation")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    embed_device_help = "Run embeddings locally on DEVICE (e.g. 'cpu') instead of calling the server (env DREAM_EMBED_DEVICE)"
+
     p_consolidate = sub.add_parser("consolidate", help="Synthesize recent conversations into graph nodes")
     p_consolidate.add_argument("--days", type=int, default=None, help="Limit to last N days (default: all un-dreamed)")
     p_consolidate.add_argument("--batch-size", type=int, default=None, help=f"Chunks per synthesis batch (default: {BATCH_SIZE}, env DREAM_BATCH_SIZE)")
+    p_consolidate.add_argument("--embed-device", type=str, default=None, help=embed_device_help)
 
     p_reconsolidate = sub.add_parser("reconsolidate", help="Process activated edges and reconsolidate embeddings")
+    p_reconsolidate.add_argument("--embed-device", type=str, default=None, help=embed_device_help)
 
     p_full = sub.add_parser("full", help="Full dream cycle: consolidate + reconsolidate")
     p_full.add_argument("--days", type=int, default=None, help="Limit to last N days (default: all un-dreamed)")
     p_full.add_argument("--batch-size", type=int, default=None, help=f"Chunks per synthesis batch (default: {BATCH_SIZE}, env DREAM_BATCH_SIZE)")
+    p_full.add_argument("--embed-device", type=str, default=None, help=embed_device_help)
 
     p_stats = sub.add_parser("stats", help="Print graph statistics")
 
     args = parser.parse_args()
+
+    # CLI flag overrides env var
+    if getattr(args, "embed_device", None):
+        global DREAM_EMBED_DEVICE
+        DREAM_EMBED_DEVICE = args.embed_device
 
     if not CLAUDE_CLI:
         sys.exit("Error: claude CLI not found. Set CLAUDE_CLI to the full path (e.g. /opt/homebrew/bin/claude).")
